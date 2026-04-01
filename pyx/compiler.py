@@ -10,6 +10,35 @@ from pathlib import Path
 TYPE_MAP = {"int": "i64", "float": "double", "bool": "i1"}
 
 
+def _find_dunder_main_call(tree: ast.Module) -> str | None:
+    """Return the name of the function called in ``if __name__ == "__main__": fn()`` at module level, or None."""
+    for node in tree.body:
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not (
+            isinstance(test, ast.Compare)
+            and isinstance(test.left, ast.Name)
+            and test.left.id == "__name__"
+            and len(test.ops) == 1
+            and isinstance(test.ops[0], ast.Eq)
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value == "__main__"
+        ):
+            continue
+        if len(node.body) == 1 and isinstance(node.body[0], ast.Expr):
+            call = node.body[0].value
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and not call.args
+                and not call.keywords
+            ):
+                return call.func.id
+    return None
+
+
 @dataclass
 class CompileError(Exception):
     message: str
@@ -27,9 +56,11 @@ class _FunctionCompiler:
         self,
         node: ast.FunctionDef,
         signatures: dict[str, tuple[list[str], str]],
+        name_remap: dict[str, str] | None = None,
     ) -> None:
         self.node = node
         self.signatures = signatures
+        self.name_remap: dict[str, str] = name_remap or {}
         self.entry_lines: list[str] = []
         self.body_lines: list[str] = []
         self.reg_idx = 0
@@ -50,7 +81,8 @@ class _FunctionCompiler:
 
         ret_t = self._annotation_to_type(self.node.returns, self.node, "return type")
 
-        header = [f"define {TYPE_MAP[ret_t]} @{self.node.name}({', '.join(arg_sig)}) {{", "entry:"]
+        fn_name = self.name_remap.get(self.node.name, self.node.name)
+        header = [f"define {TYPE_MAP[ret_t]} @{fn_name}({', '.join(arg_sig)}) {{", "entry:"]
         terminated = self._compile_statements(self.node.body, ret_t)
         if not terminated:
             raise CompileError(
@@ -210,8 +242,9 @@ class _FunctionCompiler:
                 self._require_type(got_t, expected_t, node, f"call arg type mismatch for '{callee}'")
                 compiled_args.append(f"{TYPE_MAP[expected_t]} {val}")
 
+            callee_ir = self.name_remap.get(callee, callee)
             reg = self._new_reg()
-            self.body_lines.append(f"  {reg} = call {TYPE_MAP[ret_t]} @{callee}({', '.join(compiled_args)})")
+            self.body_lines.append(f"  {reg} = call {TYPE_MAP[ret_t]} @{callee_ir}({', '.join(compiled_args)})")
             return reg, ret_t
 
         raise CompileError(
@@ -262,6 +295,11 @@ class LLVMCompiler:
         if not functions:
             raise CompileError("no top-level functions found to compile")
 
+        main_caller = _find_dunder_main_call(self.tree)
+        # If the called function is named 'main', rename it to 'pyx_main' to avoid
+        # clashing with the C-level 'main' entry point we will emit below.
+        name_remap: dict[str, str] = {"main": "pyx_main"} if main_caller == "main" else {}
+
         signatures: dict[str, tuple[list[str], str]] = {}
         for fn in functions:
             arg_types = [self._annotation_to_type(a.annotation, a, f"parameter '{a.arg}'") for a in fn.args.args]
@@ -270,8 +308,35 @@ class LLVMCompiler:
 
         chunks = ["; ModuleID = 'pyx'", "source_filename = \"pyx\"", ""]
         for fn in functions:
-            chunks.extend(_FunctionCompiler(fn, signatures).compile())
+            chunks.extend(_FunctionCompiler(fn, signatures, name_remap).compile())
             chunks.append("")
+
+        if main_caller is not None:
+            if main_caller not in signatures:
+                raise CompileError(f"'{main_caller}' is not defined but called in if __name__ == '__main__' block")
+            caller_arg_types, caller_ret_t = signatures[main_caller]
+            if caller_arg_types:
+                raise CompileError(
+                    f"function '{main_caller}' called from if __name__ == '__main__' must take no arguments"
+                )
+            callee_ir_name = name_remap.get(main_caller, main_caller)
+            llvm_ret = TYPE_MAP[caller_ret_t]
+            entry_lines = ["define i32 @main() {", "entry:"]
+            if caller_ret_t == "int":
+                entry_lines += [
+                    f"  %pyx_ret = call {llvm_ret} @{callee_ir_name}()",
+                    "  %exit_code = trunc i64 %pyx_ret to i32",
+                    "  ret i32 %exit_code",
+                ]
+            else:
+                entry_lines += [
+                    f"  call {llvm_ret} @{callee_ir_name}()",
+                    "  ret i32 0",
+                ]
+            entry_lines.append("}")
+            chunks.extend(entry_lines)
+            chunks.append("")
+
         return "\n".join(chunks).strip() + "\n"
 
     def _annotation_to_type(self, annotation: ast.AST | None, node: ast.AST, label: str) -> str:

@@ -60,6 +60,43 @@ def sum_to(n: int) -> int:
     assert "load i64" in ir
 
 
+def test_dunder_main_emits_native_entry_point(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def main() -> int:
+    return 0
+
+if __name__ == "__main__":
+    main()
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    # PyX 'main' is renamed to 'pyx_main' to avoid clashing with the C entry point
+    assert "define i64 @pyx_main()" in ir
+    assert "define i32 @main()" in ir
+    assert "call i64 @pyx_main()" in ir
+    assert "trunc i64 %pyx_ret to i32" in ir
+
+
+def test_dunder_main_non_int_return(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run() -> bool:
+    return True
+
+if __name__ == "__main__":
+    run()
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "define i1 @run()" in ir
+    assert "define i32 @main()" in ir
+    assert "call i1 @run()" in ir
+    assert "ret i32 0" in ir
+
+
 def test_float_and_bool_lowering(tmp_path: Path) -> None:
     src = write_tmp(
         tmp_path,

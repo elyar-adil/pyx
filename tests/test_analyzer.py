@@ -36,6 +36,21 @@ def f(x: int) -> int:
     assert any("cannot change type" in e.message for e in errors)
 
 
+def test_dunder_main_pattern_ok(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def main() -> int:
+    return 0
+
+if __name__ == "__main__":
+    main()
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
 def test_reflection_rejected(tmp_path: Path) -> None:
     src = write_tmp(
         tmp_path,
