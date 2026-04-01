@@ -10,33 +10,18 @@ from pathlib import Path
 TYPE_MAP = {"int": "i64", "float": "double", "bool": "i1"}
 
 
-def _find_dunder_main_call(tree: ast.Module) -> str | None:
-    """Return the name of the function called in ``if __name__ == "__main__": fn()`` at module level, or None."""
-    for node in tree.body:
-        if not isinstance(node, ast.If):
-            continue
-        test = node.test
-        if not (
-            isinstance(test, ast.Compare)
-            and isinstance(test.left, ast.Name)
-            and test.left.id == "__name__"
-            and len(test.ops) == 1
-            and isinstance(test.ops[0], ast.Eq)
-            and len(test.comparators) == 1
-            and isinstance(test.comparators[0], ast.Constant)
-            and test.comparators[0].value == "__main__"
-        ):
-            continue
-        if len(node.body) == 1 and isinstance(node.body[0], ast.Expr):
-            call = node.body[0].value
-            if (
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Name)
-                and not call.args
-                and not call.keywords
-            ):
-                return call.func.id
-    return None
+def _is_dunder_main_test(test: ast.AST) -> bool:
+    """Return True if *test* is the ``__name__ == "__main__"`` compile-time constant."""
+    return (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Name)
+        and test.left.id == "__name__"
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value == "__main__"
+    )
 
 
 @dataclass
@@ -51,14 +36,14 @@ class CompileError(Exception):
         return f"line {self.line}:{self.col or 0}: {self.message}"
 
 
-class _FunctionCompiler:
+class _BaseCompiler:
+    """Shared LLVM IR compilation logic for function bodies and module-level code."""
+
     def __init__(
         self,
-        node: ast.FunctionDef,
         signatures: dict[str, tuple[list[str], str]],
         name_remap: dict[str, str] | None = None,
     ) -> None:
-        self.node = node
         self.signatures = signatures
         self.name_remap: dict[str, str] = name_remap or {}
         self.entry_lines: list[str] = []
@@ -67,36 +52,11 @@ class _FunctionCompiler:
         self.label_idx = 0
         self.slot_types: dict[str, str] = {}
 
-    def compile(self) -> list[str]:
-        arg_types: list[str] = []
-        arg_sig: list[str] = []
-        for arg in self.node.args.args:
-            ty = self._annotation_to_type(arg.annotation, arg, f"parameter '{arg.arg}'")
-            arg_types.append(ty)
-            llvm_t = TYPE_MAP[ty]
-            arg_name = f"%{arg.arg}"
-            arg_sig.append(f"{llvm_t} {arg_name}")
-            self._ensure_slot(arg.arg, ty)
-            self.body_lines.append(f"  store {llvm_t} {arg_name}, ptr %{arg.arg}.slot")
-
-        ret_t = self._annotation_to_type(self.node.returns, self.node, "return type")
-
-        fn_name = self.name_remap.get(self.node.name, self.node.name)
-        header = [f"define {TYPE_MAP[ret_t]} @{fn_name}({', '.join(arg_sig)}) {{", "entry:"]
-        terminated = self._compile_statements(self.node.body, ret_t)
-        if not terminated:
-            raise CompileError(
-                f"Function '{self.node.name}' must explicitly return on all paths for LLVM lowering",
-                self.node.lineno,
-                self.node.col_offset,
-            )
-
-        footer = ["}"]
-        return header + self.entry_lines + self.body_lines + footer
-
-    def _compile_statements(self, body: list[ast.stmt], expected_ret: str) -> bool:
+    def _compile_statements(self, body: list[ast.stmt], expected_ret: str | None) -> bool:
         for stmt in body:
             if isinstance(stmt, ast.Return):
+                if expected_ret is None:
+                    raise CompileError("return is not allowed at module level", stmt.lineno, stmt.col_offset)
                 if stmt.value is None:
                     raise CompileError("void return is not supported", stmt.lineno, stmt.col_offset)
                 value, ty = self._compile_expr(stmt.value)
@@ -115,7 +75,19 @@ class _FunctionCompiler:
                 self.body_lines.append(f"  store {TYPE_MAP[ty]} {value}, ptr %{name}.slot")
                 continue
 
+            if isinstance(stmt, ast.Expr):
+                # Expression statement: compile and discard the result.
+                self._compile_expr(stmt.value)
+                continue
+
             if isinstance(stmt, ast.If):
+                # __name__ == "__main__" is always True at compile time: inline the body.
+                if _is_dunder_main_test(stmt.test):
+                    terminated = self._compile_statements(stmt.body, expected_ret)
+                    if terminated:
+                        return True
+                    continue
+
                 cond, cond_t = self._compile_expr(stmt.test)
                 self._require_type(cond_t, "bool", stmt, "if condition must be bool")
                 then_label = self._new_label("then")
@@ -280,6 +252,57 @@ class _FunctionCompiler:
         return f"{prefix}{self.label_idx}"
 
 
+class _FunctionCompiler(_BaseCompiler):
+    def __init__(
+        self,
+        node: ast.FunctionDef,
+        signatures: dict[str, tuple[list[str], str]],
+        name_remap: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(signatures, name_remap)
+        self.node = node
+
+    def compile(self) -> list[str]:
+        arg_types: list[str] = []
+        arg_sig: list[str] = []
+        for arg in self.node.args.args:
+            ty = self._annotation_to_type(arg.annotation, arg, f"parameter '{arg.arg}'")
+            arg_types.append(ty)
+            llvm_t = TYPE_MAP[ty]
+            arg_name = f"%{arg.arg}"
+            arg_sig.append(f"{llvm_t} {arg_name}")
+            self._ensure_slot(arg.arg, ty)
+            self.body_lines.append(f"  store {llvm_t} {arg_name}, ptr %{arg.arg}.slot")
+
+        ret_t = self._annotation_to_type(self.node.returns, self.node, "return type")
+
+        fn_name = self.name_remap.get(self.node.name, self.node.name)
+        header = [f"define {TYPE_MAP[ret_t]} @{fn_name}({', '.join(arg_sig)}) {{", "entry:"]
+        terminated = self._compile_statements(self.node.body, ret_t)
+        if not terminated:
+            raise CompileError(
+                f"Function '{self.node.name}' must explicitly return on all paths for LLVM lowering",
+                self.node.lineno,
+                self.node.col_offset,
+            )
+
+        footer = ["}"]
+        return header + self.entry_lines + self.body_lines + footer
+
+
+class _EntryPointCompiler(_BaseCompiler):
+    """Compiles module-level statements into a C ``define i32 @main()`` entry point."""
+
+    def compile(self, stmts: list[ast.stmt]) -> list[str]:
+        self._compile_statements(stmts, expected_ret=None)
+        return (
+            ["define i32 @main() {", "entry:"]
+            + self.entry_lines
+            + self.body_lines
+            + ["  ret i32 0", "}"]
+        )
+
+
 class LLVMCompiler:
     def __init__(self, tree: ast.Module) -> None:
         self.tree = tree
@@ -295,10 +318,13 @@ class LLVMCompiler:
         if not functions:
             raise CompileError("no top-level functions found to compile")
 
-        main_caller = _find_dunder_main_call(self.tree)
-        # If the called function is named 'main', rename it to 'pyx_main' to avoid
-        # clashing with the C-level 'main' entry point we will emit below.
-        name_remap: dict[str, str] = {"main": "pyx_main"} if main_caller == "main" else {}
+        module_stmts = [n for n in self.tree.body if not isinstance(n, ast.FunctionDef)]
+
+        # If we will emit a C 'main' entry point and a PyX function is also named
+        # 'main', rename the PyX one to 'pyx_main' to avoid an LLVM symbol clash.
+        name_remap: dict[str, str] = {}
+        if module_stmts and any(fn.name == "main" for fn in functions):
+            name_remap = {"main": "pyx_main"}
 
         signatures: dict[str, tuple[list[str], str]] = {}
         for fn in functions:
@@ -311,30 +337,8 @@ class LLVMCompiler:
             chunks.extend(_FunctionCompiler(fn, signatures, name_remap).compile())
             chunks.append("")
 
-        if main_caller is not None:
-            if main_caller not in signatures:
-                raise CompileError(f"'{main_caller}' is not defined but called in if __name__ == '__main__' block")
-            caller_arg_types, caller_ret_t = signatures[main_caller]
-            if caller_arg_types:
-                raise CompileError(
-                    f"function '{main_caller}' called from if __name__ == '__main__' must take no arguments"
-                )
-            callee_ir_name = name_remap.get(main_caller, main_caller)
-            llvm_ret = TYPE_MAP[caller_ret_t]
-            entry_lines = ["define i32 @main() {", "entry:"]
-            if caller_ret_t == "int":
-                entry_lines += [
-                    f"  %pyx_ret = call {llvm_ret} @{callee_ir_name}()",
-                    "  %exit_code = trunc i64 %pyx_ret to i32",
-                    "  ret i32 %exit_code",
-                ]
-            else:
-                entry_lines += [
-                    f"  call {llvm_ret} @{callee_ir_name}()",
-                    "  ret i32 0",
-                ]
-            entry_lines.append("}")
-            chunks.extend(entry_lines)
+        if module_stmts:
+            chunks.extend(_EntryPointCompiler(signatures, name_remap).compile(module_stmts))
             chunks.append("")
 
         return "\n".join(chunks).strip() + "\n"

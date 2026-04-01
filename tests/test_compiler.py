@@ -76,7 +76,7 @@ if __name__ == "__main__":
     assert "define i64 @pyx_main()" in ir
     assert "define i32 @main()" in ir
     assert "call i64 @pyx_main()" in ir
-    assert "trunc i64 %pyx_ret to i32" in ir
+    assert "ret i32 0" in ir
 
 
 def test_dunder_main_non_int_return(tmp_path: Path) -> None:
@@ -95,6 +95,57 @@ if __name__ == "__main__":
     assert "define i32 @main()" in ir
     assert "call i1 @run()" in ir
     assert "ret i32 0" in ir
+
+
+def test_dunder_main_call_with_args(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def add(a: int, b: int) -> int:
+    return a + b
+
+if __name__ == "__main__":
+    add(1, 2)
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "define i64 @add(i64 %a, i64 %b)" in ir
+    assert "define i32 @main()" in ir
+    assert "call i64 @add(i64 1, i64 2)" in ir
+
+
+def test_dunder_main_multiple_stmts(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def compute(x: int) -> int:
+    return x * 2
+
+if __name__ == "__main__":
+    compute(3)
+    compute(4)
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "define i32 @main()" in ir
+    assert ir.count("call i64 @compute") == 2
+
+
+def test_module_level_assignment(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def double(x: int) -> int:
+    return x * 2
+
+if __name__ == "__main__":
+    result = double(21)
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "define i32 @main()" in ir
+    assert "call i64 @double" in ir
+    assert "store i64" in ir
 
 
 def test_float_and_bool_lowering(tmp_path: Path) -> None:
