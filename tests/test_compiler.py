@@ -148,6 +148,25 @@ if __name__ == "__main__":
     assert "store i64" in ir
 
 
+def test_module_level_annotated_assignment(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def add(a: int, b: int) -> int:
+    return a + b
+
+x: int = 1
+if __name__ == "__main__":
+    add(x, 2)
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "define i32 @main()" in ir
+    assert "%x.slot = alloca i64" in ir
+    assert "store i64 1, ptr %x.slot" in ir
+    assert "call i64 @add(" in ir
+
+
 def test_float_and_bool_lowering(tmp_path: Path) -> None:
     src = write_tmp(
         tmp_path,

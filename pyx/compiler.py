@@ -75,6 +75,18 @@ class _BaseCompiler:
                 self.body_lines.append(f"  store {TYPE_MAP[ty]} {value}, ptr %{name}.slot")
                 continue
 
+            if isinstance(stmt, ast.AnnAssign):
+                if not isinstance(stmt.target, ast.Name):
+                    raise CompileError("only simple name annotation is supported", stmt.lineno, stmt.col_offset)
+                name = stmt.target.id
+                ann_t = self._annotation_to_type(stmt.annotation, stmt.target, f"variable '{name}'")
+                self._ensure_slot(name, ann_t)
+                if stmt.value is not None:
+                    value, val_t = self._compile_expr(stmt.value)
+                    self._require_type(val_t, ann_t, stmt, f"assignment type mismatch for '{name}'")
+                    self.body_lines.append(f"  store {TYPE_MAP[ann_t]} {value}, ptr %{name}.slot")
+                continue
+
             if isinstance(stmt, ast.Expr):
                 # Expression statement: compile and discard the result.
                 self._compile_expr(stmt.value)
