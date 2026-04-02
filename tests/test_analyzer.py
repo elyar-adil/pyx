@@ -46,3 +46,34 @@ def f(x: int) -> int:
     )
     errors = Analyzer().analyze_path(src)
     assert any("not allowed" in e.message for e in errors)
+
+
+def test_print_primitives_ok(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def f(i: int, x: float, b: bool, s: str) -> int:
+    print(i)
+    print(x)
+    print(b)
+    print(s)
+    print(i, x, b, s)
+    print()
+    return i
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+def test_print_unsupported_arg_rejected(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def f(xs: list[int]) -> int:
+    print(xs)
+    return 0
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert any("unsupported type" in e.message for e in errors)
