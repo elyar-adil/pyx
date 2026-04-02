@@ -1,8 +1,6 @@
 # PyX Prototype
 
-PyX（Python eXtended Static）是一个"Python 严格子集 + 类型驱动编译"原型，目标是编译为原生可执行文件并能直接调用平台原生 API。
-
-**长期目标**：用 PyX 重写 [rENDER](https://github.com/elyar-adil/rENDER) 浏览器引擎，以 Win32/GDI 和 X11/Cairo 替代 Qt，验证 PyX 可用于实现生产级原生 GUI 应用。
+PyX（Python eXtended Static）是一个"Python 严格子集 + 类型驱动编译"原型，目标是编译为原生可执行文件。
 
 ## 当前实现
 
@@ -36,29 +34,9 @@ python -m pyx.cli build examples/fib.py -o dist
 - `<name>.o`：原生目标文件（如果系统可用 `clang`）
 - `build_report.json`：构建元数据
 
-## 原生 API 支持计划
+## 生态系统
 
-PyX 将在 Phase 4 引入 C ABI FFI，支持直接声明并调用原生系统库：
-
-```python
-# 示意语法（Phase 4 目标）
-#link "user32"
-extern "C" def CreateWindowExA(
-    dwExStyle: int,
-    lpClassName: ptr[str],
-    lpWindowName: ptr[str],
-    dwStyle: int,
-    x: int, y: int, nWidth: int, nHeight: int,
-    hWndParent: void_ptr,
-    hMenu: void_ptr,
-    hInstance: void_ptr,
-    lpParam: void_ptr,
-) -> void_ptr: ...
-```
-
-目标平台：
-- **Windows**：Win32 / GDI（窗口、消息循环、GDI 绘图）
-- **Linux**：X11/xcb 或 Wayland+EGL + Cairo 光栅化
+PyX 本身只负责语言核心；平台绑定（Win32、X11、Wayland 等）、网络库、GUI 框架等由独立的生态包提供，通过 `pyx pkg` 包管理器安装和依赖。
 
 ## Roadmap
 
