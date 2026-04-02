@@ -75,9 +75,22 @@ class Analyzer(ast.NodeVisitor):
             self.var_types[node.target.id] = annotated
         self.generic_visit(node)
 
+    _PRINTABLE_TYPES: frozenset[str] = frozenset({"int", "float", "bool", "str"})
+
     def visit_Call(self, node: ast.Call) -> None:
-        if isinstance(node.func, ast.Name) and node.func.id in {"getattr", "setattr", "delattr"}:
-            self._error(node, f"'{node.func.id}' is not allowed in statically compilable subset")
+        if isinstance(node.func, ast.Name):
+            name = node.func.id
+            if name in {"getattr", "setattr", "delattr"}:
+                self._error(node, f"'{name}' is not allowed in statically compilable subset")
+            elif name == "print":
+                for i, arg in enumerate(node.args):
+                    arg_type = self._infer_expr_type(arg)
+                    if arg_type not in self._PRINTABLE_TYPES and arg_type != "Any":
+                        self._error(
+                            arg,
+                            f"print() argument {i + 1} has unsupported type '{arg_type}';"
+                            f" expected one of: {', '.join(sorted(self._PRINTABLE_TYPES))}",
+                        )
         self.generic_visit(node)
 
     def visit_Return(self, node: ast.Return) -> None:
@@ -134,6 +147,8 @@ class Analyzer(ast.NodeVisitor):
                 return "float"
             return "Any"
         if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id == "print":
+                return "None"
             return "Any"
         return "Any"
 

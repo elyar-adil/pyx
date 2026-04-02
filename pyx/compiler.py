@@ -7,7 +7,86 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-TYPE_MAP = {"int": "i64", "float": "double", "bool": "i1"}
+TYPE_MAP = {"int": "i64", "float": "double", "bool": "i1", "str": "ptr"}
+
+# Format string globals emitted when print() is used.
+# Each entry: (global_name, byte_count, llvm_c_string)
+_PRINT_FMT_DEFS: tuple[tuple[str, int, str], ...] = (
+    ("@__pyx_fmt_int_sp",  5, 'c"%ld \\00"'),
+    ("@__pyx_fmt_int_nl",  5, 'c"%ld\\0a\\00"'),
+    ("@__pyx_fmt_flt_sp",  4, 'c"%g \\00"'),
+    ("@__pyx_fmt_flt_nl",  4, 'c"%g\\0a\\00"'),
+    ("@__pyx_fmt_str_sp",  4, 'c"%s \\00"'),
+    ("@__pyx_fmt_str_nl",  4, 'c"%s\\0a\\00"'),
+    ("@__pyx_fmt_nl",      2, 'c"\\0a\\00"'),
+    ("@__pyx_str_True",    5, 'c"True\\00"'),
+    ("@__pyx_str_False",   6, 'c"False\\00"'),
+)
+
+# fmt lookup: pyx_type -> (space_variant_name, newline_variant_name)
+_PRINT_FMT: dict[str, tuple[str, str]] = {
+    "int":   ("@__pyx_fmt_int_sp", "@__pyx_fmt_int_nl"),
+    "float": ("@__pyx_fmt_flt_sp", "@__pyx_fmt_flt_nl"),
+    "str":   ("@__pyx_fmt_str_sp", "@__pyx_fmt_str_nl"),
+    "bool":  ("@__pyx_fmt_str_sp", "@__pyx_fmt_str_nl"),
+}
+
+
+def _encode_llvm_string(value: str) -> tuple[str, int]:
+    """Encode a Python string as an LLVM ``c"..."`` literal.
+
+    Returns ``(llvm_literal, byte_count)`` where *byte_count* includes the
+    null terminator.  Only UTF-8 is supported; characters outside the printable
+    ASCII range (0x20–0x7E, excluding ``"`` and ``\\``) are hex-escaped.
+    """
+    parts: list[str] = []
+    for byte in value.encode("utf-8"):
+        if 0x20 <= byte <= 0x7E and byte not in (0x22, 0x5C):  # not " or \
+            parts.append(chr(byte))
+        else:
+            parts.append(f"\\{byte:02x}")
+    parts.append("\\00")
+    return f'c"{"".join(parts)}"', len(value.encode("utf-8")) + 1
+
+
+class _ModuleContext:
+    """Accumulates module-level globals required during function compilation.
+
+    A single instance is shared across all ``_FunctionCompiler`` objects for
+    one compilation unit.  After all functions are compiled, call
+    :meth:`emit_preamble` to obtain the LLVM IR lines that must appear before
+    any function definitions.
+    """
+
+    def __init__(self) -> None:
+        self.uses_printf: bool = False
+        # Ordered mapping value -> global_name for deduplication.
+        self._str_by_value: dict[str, str] = {}
+        self._str_globals: list[tuple[str, str]] = []  # (name, value)
+        self._str_counter: int = 0
+
+    def alloc_string(self, value: str) -> str:
+        """Intern *value* and return its LLVM global name (``@__pyx_str_N``)."""
+        if value not in self._str_by_value:
+            name = f"@__pyx_str_{self._str_counter}"
+            self._str_counter += 1
+            self._str_by_value[value] = name
+            self._str_globals.append((name, value))
+        return self._str_by_value[value]
+
+    def emit_preamble(self) -> list[str]:
+        """Return LLVM IR lines for all globals/declarations collected so far."""
+        if not self.uses_printf:
+            return []
+        lines: list[str] = []
+        for gname, nbytes, data in _PRINT_FMT_DEFS:
+            lines.append(f"{gname} = private unnamed_addr constant [{nbytes} x i8] {data}")
+        for gname, value in self._str_globals:
+            literal, nbytes = _encode_llvm_string(value)
+            lines.append(f"{gname} = private unnamed_addr constant [{nbytes} x i8] {literal}")
+        lines.append("declare i32 @printf(ptr, ...)")
+        lines.append("")
+        return lines
 
 
 @dataclass
@@ -27,9 +106,11 @@ class _FunctionCompiler:
         self,
         node: ast.FunctionDef,
         signatures: dict[str, tuple[list[str], str]],
+        ctx: _ModuleContext,
     ) -> None:
         self.node = node
         self.signatures = signatures
+        self.ctx = ctx
         self.entry_lines: list[str] = []
         self.body_lines: list[str] = []
         self.reg_idx = 0
@@ -123,6 +204,17 @@ class _FunctionCompiler:
                 self.body_lines.append(f"{end_label}:")
                 continue
 
+            if isinstance(stmt, ast.Expr):
+                if isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name):
+                    if stmt.value.func.id == "print":
+                        self._compile_print(stmt.value)
+                        continue
+                raise CompileError(
+                    "only print() calls are supported as expression statements",
+                    stmt.lineno,
+                    stmt.col_offset,
+                )
+
             raise CompileError(
                 f"unsupported statement {stmt.__class__.__name__} in LLVM mode",
                 stmt.lineno,
@@ -130,6 +222,52 @@ class _FunctionCompiler:
             )
 
         return False
+
+    def _compile_print(self, node: ast.Call) -> None:
+        """Lower a ``print(...)`` call to one or more ``printf`` invocations."""
+        self.ctx.uses_printf = True
+        args = node.args
+        n = len(args)
+
+        if n == 0:
+            reg = self._new_reg()
+            self.body_lines.append(f"  {reg} = call i32 (ptr, ...) @printf(ptr @__pyx_fmt_nl)")
+            return
+
+        for i, arg_node in enumerate(args):
+            is_last = i == n - 1
+            val, ty = self._compile_expr(arg_node)
+            if ty not in _PRINT_FMT:
+                raise CompileError(
+                    f"print() argument has unsupported type '{ty}'",
+                    getattr(arg_node, "lineno", None),
+                    getattr(arg_node, "col_offset", None),
+                )
+            fmt_sp, fmt_nl = _PRINT_FMT[ty]
+            fmt = fmt_nl if is_last else fmt_sp
+            reg = self._new_reg()
+
+            if ty == "bool":
+                # Materialise "True" / "False" at runtime via select.
+                str_reg = self._new_reg()
+                self.body_lines.append(
+                    f"  {str_reg} = select i1 {val}, ptr @__pyx_str_True, ptr @__pyx_str_False"
+                )
+                self.body_lines.append(
+                    f"  {reg} = call i32 (ptr, ...) @printf(ptr {fmt}, ptr {str_reg})"
+                )
+            elif ty == "int":
+                self.body_lines.append(
+                    f"  {reg} = call i32 (ptr, ...) @printf(ptr {fmt}, i64 {val})"
+                )
+            elif ty == "float":
+                self.body_lines.append(
+                    f"  {reg} = call i32 (ptr, ...) @printf(ptr {fmt}, double {val})"
+                )
+            else:  # str
+                self.body_lines.append(
+                    f"  {reg} = call i32 (ptr, ...) @printf(ptr {fmt}, ptr {val})"
+                )
 
     def _compile_expr(self, node: ast.AST) -> tuple[str, str]:
         if isinstance(node, ast.Constant):
@@ -139,6 +277,10 @@ class _FunctionCompiler:
                 return (str(node.value), "int")
             if isinstance(node.value, float):
                 return (str(node.value), "float")
+            if isinstance(node.value, str):
+                gname = self.ctx.alloc_string(node.value)
+                self.ctx.uses_printf = True  # str literals only appear via print paths
+                return (gname, "str")
 
         if isinstance(node, ast.Name):
             if node.id not in self.slot_types:
@@ -198,6 +340,12 @@ class _FunctionCompiler:
 
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             callee = node.func.id
+            if callee == "print":
+                raise CompileError(
+                    "'print()' is a statement; its return value cannot be used in an expression",
+                    getattr(node, "lineno", None),
+                    getattr(node, "col_offset", None),
+                )
             if callee not in self.signatures:
                 raise CompileError(f"call target '{callee}' is not a known function", node.lineno, node.col_offset)
             arg_types, ret_t = self.signatures[callee]
@@ -268,9 +416,15 @@ class LLVMCompiler:
             ret_t = self._annotation_to_type(fn.returns, fn, "return type")
             signatures[fn.name] = (arg_types, ret_t)
 
+        ctx = _ModuleContext()
+        function_chunks: list[list[str]] = [
+            _FunctionCompiler(fn, signatures, ctx).compile() for fn in functions
+        ]
+
         chunks = ["; ModuleID = 'pyx'", "source_filename = \"pyx\"", ""]
-        for fn in functions:
-            chunks.extend(_FunctionCompiler(fn, signatures).compile())
+        chunks.extend(ctx.emit_preamble())
+        for fn_lines in function_chunks:
+            chunks.extend(fn_lines)
             chunks.append("")
         return "\n".join(chunks).strip() + "\n"
 
