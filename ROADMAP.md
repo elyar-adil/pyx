@@ -70,20 +70,36 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 ### 目标
 让 PyX 能声明并调用任意 C ABI 函数，是生态包（平台绑定、系统库封装等）的基础。
 
+### 设计原则
+FFI 通过 `pyx.ffi` 标准模块实现，**不引入任何新语法**，保持 `.py` 文件对 Python 解释器的完全兼容。
+`pyx.ffi` 在 Python 运行时退化为 ctypes 封装，在 pyx 编译时由 analyzer 静态识别模式并生成原生调用。
+
+```python
+from pyx.ffi import CDLL, c_int, c_char_p
+
+libc = CDLL("c")          # 运行时：ctypes.CDLL；编译时：链接 -lc
+
+@libc.func(c_int, [c_char_p])
+def puts(s: c_char_p) -> c_int: ...   # 运行时：ctypes 函数；编译时：extern C 声明
+
+puts(b"hello")            # 两种环境下行为一致
+```
+
 ### 计划项
-1. **FFI 语法**
-   - `extern "C"` 函数声明
-   - 原始指针类型：`ptr[T]`、`void_ptr`
-   - `unsafe` 块标记，隔离不安全操作
-   - 链接指令：`#link "libname"`
-2. **类型映射**
-   - PyX 类型 ↔ C 类型的 ABI 对齐（整数宽度、struct 内存布局、调用约定）
+1. **`pyx.ffi` 模块**
+   - `CDLL(name)`：声明动态库依赖
+   - `@lib.func(ret, [args])`：装饰器声明 C 函数签名
+   - C 兼容类型：`c_int`、`c_long`、`c_char_p`、`c_void_p`、`c_double` 等
+2. **编译器模式识别**
+   - analyzer 静态识别 `CDLL` + `@lib.func` 模式，提取链接依赖和函数签名
+   - compiler 生成对应的 LLVM IR extern 声明与调用指令
 3. **构建集成**
-   - `pyx build` 支持向链接器传递 `-l` 参数
+   - `pyx build` 根据识别到的 `CDLL` 自动向链接器传递 `-l` 参数
    - `build_report.json` 记录外部依赖
 
 ### 完成标准
-- 能通过 FFI 调用 libc 函数（如 `printf`、`malloc`）并通过端到端测试。
+- 同一份 `.py` 文件既能被 `python` 直接运行，也能被 `pyx build` 编译为原生可执行文件。
+- 能通过 FFI 调用 libc 函数（如 `puts`、`abs`）并通过端到端测试。
 
 ---
 
@@ -97,7 +113,7 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
    - `pyx pkg install <name>`：从中央索引下载并安装包
    - `pyx pkg publish`：打包并发布到索引
 2. **包格式**
-   - `pyx.toml`：包元数据（名称、版本、依赖、`#link` 声明）
+   - `pyx.toml`：包元数据（名称、版本、依赖、动态库声明）
    - 支持预编译的 `.o` / `.a` 分发（跨平台 FFI 包的常见形式）
 3. **依赖解析**
    - 语义化版本约束
@@ -133,6 +149,6 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 ## 风险与依赖
 
 1. **语义风险**：Python 语义与静态编译模型存在天然冲突，需要持续明确"可编译子集边界"。
-2. **FFI 复杂度**：C ABI 的指针、对齐、调用约定细节多，需要严格测试防止内存安全问题。
+2. **FFI 复杂度**：C ABI 的指针、对齐、调用约定细节多；`pyx.ffi` 的运行时（ctypes）与编译时行为必须严格对齐，否则同一份代码在两种环境下结果不同。
 3. **实现风险**：手写 LLVM IR 在复杂语义下维护成本高，后续可能需要迁移到结构化 Typed IR。
 4. **生态风险**：包管理是生态落地的关键，需要尽早设计包格式和索引协议。
