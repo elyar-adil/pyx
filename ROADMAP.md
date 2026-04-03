@@ -78,24 +78,26 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 
 ### 设计原则
 直接复用标准库 `ctypes` 的 API，**不引入任何新模块或新语法**。
-`python foo.py` 时 ctypes 正常运行；`pyx build foo.py` 时编译器静态识别 ctypes 惯用模式，生成原生 LLVM extern 调用，零 ctypes 运行时开销。
+`python foo.py` 时 ctypes 正常运行；`pyx build foo.py` 时编译器静态识别 `CFUNCTYPE` 声明模式，生成原生 LLVM extern 调用，零 ctypes 运行时开销。
+
+使用 `CFUNCTYPE` 而非 `argtypes`/`restype` 赋值，原因是后者是运行时属性变更（monkey-patch），签名可在任意位置被修改，编译器无法静态确定；`CFUNCTYPE` 是纯表达式，签名在绑定点一次性固定。
 
 ```python
 import ctypes
 
-libc = ctypes.CDLL("c")           # 编译时：链接 -lc
+_libc  = ctypes.CDLL("c")                                  # 编译时：链接 -lc
+_puts_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p)  # 编译时：提取签名
+puts   = _puts_t(("puts", _libc))                          # 编译时：生成 extern 声明
 
-libc.puts.argtypes = [ctypes.c_char_p]
-libc.puts.restype  = ctypes.c_int  # 编译时：提取函数签名
-
-libc.puts(b"hello")               # 编译时：生成原生 call 指令
+puts(b"hello")                                              # 编译时：原生 call 指令
 ```
 
 ### 计划项
 1. **编译器模式识别**
    - analyzer 识别 `ctypes.CDLL("name")` → 记录链接依赖 `-lname`
-   - analyzer 识别模块级 `lib.fn.argtypes` / `lib.fn.restype` 赋值 → 提取函数签名
-   - compiler 将 `lib.fn(args)` 调用编译为 LLVM IR extern 声明 + call 指令
+   - analyzer 识别 `ctypes.CFUNCTYPE(restype, *argtypes)` → 提取函数签名
+   - analyzer 识别 `fn_t(("symbol", lib))` 绑定模式 → 关联符号与签名
+   - compiler 将绑定的函数调用编译为 LLVM IR extern 声明 + call 指令
 2. **支持的 ctypes 类型**
    - 整数：`c_int`、`c_long`、`c_longlong`、`c_size_t` 等
    - 浮点：`c_float`、`c_double`
@@ -156,7 +158,7 @@ libc.puts(b"hello")               # 编译时：生成原生 call 指令
 ## 风险与依赖
 
 1. **语义风险**：Python 语义与静态编译模型存在天然冲突，需要持续明确"可编译子集边界"。
-2. **FFI 复杂度**：C ABI 的指针、对齐、调用约定细节多；ctypes 运行时与 pyx 编译时行为必须严格对齐，否则同一份代码在两种环境下结果不同。
+2. **FFI 复杂度**：C ABI 的指针、对齐、调用约定细节多；`CFUNCTYPE` 的运行时行为与 pyx 编译时生成的 LLVM call 必须严格对齐，否则同一份代码在两种环境下结果不同。
 3. **内存管理风险**：ARC 的 inc/dec 插入点必须和 Python 引用语义完全一致；循环收集器的触发时机若处理不当会在渲染帧内引入 pause，需要限制其只在帧间或空闲时运行。
 4. **实现风险**：手写 LLVM IR 在复杂语义下维护成本高，后续可能需要迁移到结构化 Typed IR。
 5. **生态风险**：包管理是生态落地的关键，需要尽早设计包格式和索引协议。
