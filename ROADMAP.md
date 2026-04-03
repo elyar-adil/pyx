@@ -71,35 +71,36 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 让 PyX 能声明并调用任意 C ABI 函数，是生态包（平台绑定、系统库封装等）的基础。
 
 ### 设计原则
-FFI 通过 `pyx.ffi` 标准模块实现，**不引入任何新语法**，保持 `.py` 文件对 Python 解释器的完全兼容。
-`pyx.ffi` 在 Python 运行时退化为 ctypes 封装，在 pyx 编译时由 analyzer 静态识别模式并生成原生调用。
+直接复用标准库 `ctypes` 的 API，**不引入任何新模块或新语法**。
+`python foo.py` 时 ctypes 正常运行；`pyx build foo.py` 时编译器静态识别 ctypes 惯用模式，生成原生 LLVM extern 调用，零 ctypes 运行时开销。
 
 ```python
-from pyx.ffi import CDLL, c_int, c_char_p
+import ctypes
 
-libc = CDLL("c")          # 运行时：ctypes.CDLL；编译时：链接 -lc
+libc = ctypes.CDLL("c")           # 编译时：链接 -lc
 
-@libc.func(c_int, [c_char_p])
-def puts(s: c_char_p) -> c_int: ...   # 运行时：ctypes 函数；编译时：extern C 声明
+libc.puts.argtypes = [ctypes.c_char_p]
+libc.puts.restype  = ctypes.c_int  # 编译时：提取函数签名
 
-puts(b"hello")            # 两种环境下行为一致
+libc.puts(b"hello")               # 编译时：生成原生 call 指令
 ```
 
 ### 计划项
-1. **`pyx.ffi` 模块**
-   - `CDLL(name)`：声明动态库依赖
-   - `@lib.func(ret, [args])`：装饰器声明 C 函数签名
-   - C 兼容类型：`c_int`、`c_long`、`c_char_p`、`c_void_p`、`c_double` 等
-2. **编译器模式识别**
-   - analyzer 静态识别 `CDLL` + `@lib.func` 模式，提取链接依赖和函数签名
-   - compiler 生成对应的 LLVM IR extern 声明与调用指令
+1. **编译器模式识别**
+   - analyzer 识别 `ctypes.CDLL("name")` → 记录链接依赖 `-lname`
+   - analyzer 识别模块级 `lib.fn.argtypes` / `lib.fn.restype` 赋值 → 提取函数签名
+   - compiler 将 `lib.fn(args)` 调用编译为 LLVM IR extern 声明 + call 指令
+2. **支持的 ctypes 类型**
+   - 整数：`c_int`、`c_long`、`c_longlong`、`c_size_t` 等
+   - 浮点：`c_float`、`c_double`
+   - 指针：`c_void_p`、`c_char_p`、`POINTER(T)`
 3. **构建集成**
    - `pyx build` 根据识别到的 `CDLL` 自动向链接器传递 `-l` 参数
-   - `build_report.json` 记录外部依赖
+   - `build_report.json` 记录外部库依赖
 
 ### 完成标准
 - 同一份 `.py` 文件既能被 `python` 直接运行，也能被 `pyx build` 编译为原生可执行文件。
-- 能通过 FFI 调用 libc 函数（如 `puts`、`abs`）并通过端到端测试。
+- 能通过标准 ctypes 写法调用 libc 函数（如 `puts`、`abs`）并通过端到端测试。
 
 ---
 

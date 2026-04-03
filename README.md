@@ -34,9 +34,23 @@ python -m pyx.cli build examples/fib.py -o dist
 - `<name>.o`：原生目标文件（如果系统可用 `clang`）
 - `build_report.json`：构建元数据
 
+## 原生 API 调用
+
+PyX 在 Phase 4 支持以标准 `ctypes` 写法调用原生系统库，编译时生成原生调用指令，不引入任何新语法：
+
+```python
+import ctypes
+
+libc = ctypes.CDLL("c")
+libc.puts.argtypes = [ctypes.c_char_p]
+libc.puts.restype  = ctypes.c_int
+
+libc.puts(b"hello")   # python foo.py 和 pyx build foo.py 均可运行
+```
+
 ## 生态系统
 
-PyX 本身只负责语言核心；平台绑定（Win32、X11、Wayland 等）、网络库、GUI 框架等由独立的生态包提供，通过 `pyx pkg` 包管理器安装和依赖。
+PyX 本身只负责语言核心；平台绑定（Win32、X11、Wayland 等）、网络库、GUI 框架等由独立的生态包提供，基于 ctypes 模式封装，通过 `pyx pkg` 包管理器安装。
 
 ## Roadmap
 
