@@ -8,13 +8,20 @@ from pathlib import Path
 
 from .project import ClassInfo, FunctionSignature, ModuleInfo, ProjectInfo, ProjectLoadError, load_project
 from .type_system import (
+    CDLL_TYPE,
+    CTYPES_ALL_TYPES,
+    CTYPES_FLOAT_TYPES,
+    CTYPES_INT_TYPES,
     NUMERIC_UNION,
     can_assign_type,
+    ctypes_to_pyx_type,
+    is_cfuncptr_type,
     is_numeric_type,
     is_supported_type,
     is_union_type,
     merge_numeric_result_type,
     normalize_type_name,
+    parse_cfuncptr_type,
     parse_dict_type,
     parse_list_type,
     parse_set_type,
@@ -24,6 +31,32 @@ TYPE_MAP = {"int": "i64", "float": "double", "bool": "i1"}
 UNION_LLVM_TYPE = "{ i1, double }"
 STR_LLVM_TYPE = "%pyx.str"
 LIST_LLVM_TYPE = "%pyx.list"
+
+# ---------------------------------------------------------------------------
+# Phase 4: ctypes / C ABI FFI
+# ---------------------------------------------------------------------------
+
+#: Maps ctypes type names to their LLVM IR primitive types.
+CTYPES_LLVM_MAP: dict[str, str] = {
+    "c_int":       "i32",
+    "c_uint":      "i32",
+    "c_long":      "i64",
+    "c_ulong":     "i64",
+    "c_longlong":  "i64",
+    "c_ulonglong": "i64",
+    "c_short":     "i16",
+    "c_ushort":    "i16",
+    "c_byte":      "i8",
+    "c_ubyte":     "i8",
+    "c_char":      "i8",
+    "c_size_t":    "i64",
+    "c_ssize_t":   "i64",
+    "c_float":     "float",
+    "c_double":    "double",
+    "c_void_p":    "ptr",
+    "c_char_p":    "ptr",
+    "c_wchar_p":   "ptr",
+}
 
 _ERR_PROJECT = "PYX2000"
 _ERR_MISSING_ANNOTATION = "PYX2001"
@@ -87,6 +120,9 @@ def llvm_type(py_type: str) -> str:
         return STR_LLVM_TYPE
     if parse_list_type(normalized) is not None:
         return LIST_LLVM_TYPE
+    # Phase 4: cdll handles and function pointers are opaque pointers at runtime.
+    if normalized == CDLL_TYPE or is_cfuncptr_type(normalized):
+        return "ptr"
     if "." in normalized and "[" not in normalized:
         return _class_type_name(normalized)
     raise CompileError(f"type '{py_type}' cannot be lowered to LLVM IR", code=_ERR_UNSUPPORTED_TYPE)
@@ -123,6 +159,8 @@ class _ModuleContext:
         self.uses_memcpy = False
         self.uses_abort = False
         self.uses_utf8_helpers = False
+        self.uses_dlopen = False   # Phase 4: ctypes.CDLL
+        self.uses_dlsym = False    # Phase 4: fn_t(("sym", lib))
         self._str_by_value: dict[str, str] = {}
         self._str_globals: list[tuple[str, str]] = []
 
@@ -172,7 +210,11 @@ class _ModuleContext:
             lines.append("declare ptr @memcpy(ptr, ptr, i64)")
         if self.uses_abort:
             lines.append("declare void @abort()")
-        if self.uses_printf or self.uses_malloc or self.uses_realloc or self.uses_memcpy or self.uses_abort:
+        if self.uses_dlopen:
+            lines.append("declare ptr @dlopen(ptr, i32)")
+        if self.uses_dlsym:
+            lines.append("declare ptr @dlsym(ptr, ptr)")
+        if self.uses_printf or self.uses_malloc or self.uses_realloc or self.uses_memcpy or self.uses_abort or self.uses_dlopen or self.uses_dlsym:
             lines.append("")
         if self.uses_utf8_helpers:
             lines.extend(self._emit_utf8_helpers())
@@ -627,12 +669,26 @@ class _FunctionCompiler:
         if self._is_list_append_call(node):
             raise CompileError("list.append() is a statement in LLVM mode", code=_ERR_UNSUPPORTED_EXPRESSION, line=node.lineno, col=node.col_offset)
 
+        # ------------------------------------------------------------------
+        # Phase 4: ctypes FFI patterns — must be checked before the generic
+        # imported-symbol constructor path (which asserts on project modules).
+        # ------------------------------------------------------------------
+        if self._is_ctypes_call(node.func, "CDLL"):
+            return self._compile_cdll(node)
+        if self._is_ctypes_call(node.func, "CFUNCTYPE"):
+            return self._compile_cfunctype(node)
+        if self._is_cfuncptr_binding(node):
+            return self._compile_cfuncptr_binding(node)
+        if self._is_cfuncptr_call(node):
+            return self._compile_cfuncptr_call(node)
+        # ------------------------------------------------------------------
+
         if isinstance(node.func, ast.Name) and node.func.id in self.module.classes:
             return self._compile_constructor(self.module.classes[node.func.id][1], node.args, node)
 
         if isinstance(node.func, ast.Name):
             imported = self.module.imported_symbols.get(node.func.id)
-            if imported is not None:
+            if imported is not None and imported.module_name != "ctypes":
                 target_module = self.project.lookup_module(imported.module_name)
                 assert target_module is not None
                 if imported.symbol_name in target_module.classes:
@@ -640,6 +696,13 @@ class _FunctionCompiler:
 
         if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id in self.module.imported_modules:
             imported_module = self.module.imported_modules[node.func.value.id]
+            if imported_module.module_name == "ctypes":
+                raise CompileError(
+                    f"Unsupported ctypes call pattern '{ast.unparse(node.func)}'",
+                    code=_ERR_UNSUPPORTED_EXPRESSION,
+                    line=node.lineno,
+                    col=node.col_offset,
+                )
             target_module = self.project.lookup_module(imported_module.module_name)
             assert target_module is not None
             if node.func.attr in target_module.classes:
@@ -795,6 +858,214 @@ class _FunctionCompiler:
         self.body_lines.append(f"  {new_len} = add i64 {length}, 1")
         new_list = self._build_list_value(data_phi, new_len, cap_phi)
         self.body_lines.append(f"  store {LIST_LLVM_TYPE} {new_list}, ptr %{list_name}.slot")
+
+    # ------------------------------------------------------------------
+    # Phase 4: ctypes / C ABI FFI helpers
+    # ------------------------------------------------------------------
+
+    def _is_ctypes_call(self, func: ast.AST, attr: str) -> bool:
+        """Return True if *func* refers to ``ctypes.<attr>`` or an imported alias."""
+        if isinstance(func, ast.Attribute) and func.attr == attr and isinstance(func.value, ast.Name):
+            mod = self.module.imported_modules.get(func.value.id)
+            if mod is not None and mod.module_name == "ctypes":
+                return True
+        if isinstance(func, ast.Name):
+            sym = self.module.imported_symbols.get(func.id)
+            if sym is not None and sym.module_name == "ctypes" and sym.symbol_name == attr:
+                return True
+        return False
+
+    def _resolve_ctypes_type_name(self, node: ast.AST) -> str | None:
+        """Extract a ctypes type name from an AST expression node.
+
+        Handles ``ctypes.c_int``, ``c_int`` (after ``from ctypes import``),
+        and ``None`` (void return).
+        """
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.attr in CTYPES_ALL_TYPES:
+                mod = self.module.imported_modules.get(node.value.id)
+                if mod is not None and mod.module_name == "ctypes":
+                    return node.attr
+        if isinstance(node, ast.Name):
+            sym = self.module.imported_symbols.get(node.id)
+            if sym is not None and sym.module_name == "ctypes" and sym.symbol_name in CTYPES_ALL_TYPES:
+                return sym.symbol_name
+        if isinstance(node, ast.Constant) and node.value is None:
+            return "None"
+        return None
+
+    def _is_cfuncptr_binding(self, node: ast.Call) -> bool:
+        """Return True for the ``fn_type_var(("sym_name", lib_var))`` pattern."""
+        if not isinstance(node.func, ast.Name):
+            return False
+        func_t = self.slot_types.get(node.func.id)
+        if func_t is None or not is_cfuncptr_type(func_t):
+            return False
+        if len(node.args) != 1 or not isinstance(node.args[0], ast.Tuple):
+            return False
+        tup = node.args[0]
+        return (len(tup.elts) == 2
+                and isinstance(tup.elts[0], ast.Constant)
+                and isinstance(tup.elts[0].value, str))
+
+    def _is_cfuncptr_call(self, node: ast.Call) -> bool:
+        """Return True when calling a cfuncptr variable (non-binding form)."""
+        if not isinstance(node.func, ast.Name):
+            return False
+        func_t = self.slot_types.get(node.func.id)
+        return func_t is not None and is_cfuncptr_type(func_t) and not self._is_cfuncptr_binding(node)
+
+    def _compile_cdll(self, node: ast.Call) -> tuple[str, str]:
+        """Compile ``ctypes.CDLL(name)`` → ``call ptr @dlopen(ptr name, i32 1)``."""
+        self.ctx.uses_dlopen = True
+        if not node.args or not isinstance(node.args[0], ast.Constant) or not isinstance(node.args[0].value, str):
+            raise CompileError(
+                "CDLL() requires a string-literal library name",
+                code=_ERR_UNSUPPORTED_EXPRESSION,
+                line=node.lineno,
+                col=node.col_offset,
+            )
+        lib_name = node.args[0].value
+        gname = self.ctx.alloc_string(lib_name)
+        reg = self._new_reg()
+        self.body_lines.append(f"  {reg} = call ptr @dlopen(ptr {gname}, i32 1)")
+        return reg, CDLL_TYPE
+
+    def _compile_cfunctype(self, node: ast.Call) -> tuple[str, str]:
+        """Compile ``ctypes.CFUNCTYPE(restype, *argtypes)`` → null ptr.
+
+        CFUNCTYPE is a compile-time type descriptor; no runtime code is
+        generated.  The type string is re-derived from the AST arguments so
+        the compiler can use it for subsequent dlsym / indirect-call lowering.
+        """
+        ret_ctype = self._resolve_ctypes_type_name(node.args[0]) if node.args else "c_int"
+        arg_ctypes = [self._resolve_ctypes_type_name(a) for a in node.args[1:]]
+        ret = ret_ctype or "c_int"
+        valid_args = [c for c in arg_ctypes if c is not None]
+        inner = ",".join([ret] + valid_args)
+        fn_type = f"cfuncptr({inner})"
+        # No runtime code — the value is a null ptr placeholder.
+        return "null", fn_type
+
+    def _compile_cfuncptr_binding(self, node: ast.Call) -> tuple[str, str]:
+        """Compile ``fn_type_var(("sym", lib))`` → ``call ptr @dlsym(ptr lib, ptr sym)``."""
+        self.ctx.uses_dlsym = True
+        func_name = node.func.id  # type: ignore[union-attr]
+        func_t = self.slot_types[func_name]
+        tup = node.args[0]  # ast.Tuple
+        sym_name: str = tup.elts[0].value  # type: ignore[union-attr]
+        lib_node = tup.elts[1]
+
+        # Load the library handle
+        lib_val, lib_t = self._compile_expr(lib_node)
+        if lib_t != CDLL_TYPE:
+            raise CompileError(
+                f"dlsym binding expects a CDLL handle, got '{lib_t}'",
+                code=_ERR_TYPE_MISMATCH,
+                line=node.lineno,
+                col=node.col_offset,
+            )
+
+        gname = self.ctx.alloc_string(sym_name)
+        reg = self._new_reg()
+        self.body_lines.append(f"  {reg} = call ptr @dlsym(ptr {lib_val}, ptr {gname})")
+        return reg, func_t
+
+    def _compile_cfuncptr_call(self, node: ast.Call) -> tuple[str, str]:
+        """Compile an indirect call through a cfuncptr variable."""
+        func_name = node.func.id  # type: ignore[union-attr]
+        func_t = self.slot_types[func_name]
+        parsed = parse_cfuncptr_type(func_t)
+        if parsed is None:
+            raise CompileError(
+                f"Cannot call '{func_name}': not a function pointer type",
+                code=_ERR_TYPE_MISMATCH,
+                line=node.lineno,
+                col=node.col_offset,
+            )
+        ret_ctype, arg_ctypes = parsed
+
+        if len(node.args) != len(arg_ctypes):
+            raise CompileError(
+                f"Function pointer call expects {len(arg_ctypes)} argument(s), got {len(node.args)}",
+                code=_ERR_CALL_ARG_COUNT,
+                line=node.lineno,
+                col=node.col_offset,
+            )
+
+        # Load the function pointer from its slot.
+        fn_ptr = self._new_reg()
+        self.body_lines.append(f"  {fn_ptr} = load ptr, ptr %{func_name}.slot")
+
+        # Compile and coerce each argument to the expected ctypes LLVM type.
+        compiled_args: list[str] = []
+        for arg_node, expected_ctype in zip(node.args, arg_ctypes):
+            arg_val, arg_t = self._compile_expr(arg_node)
+            coerced = self._coerce_to_ctype(arg_val, arg_t, expected_ctype, arg_node)
+            ctype_llvm = CTYPES_LLVM_MAP.get(expected_ctype, "ptr")
+            compiled_args.append(f"{ctype_llvm} {coerced}")
+
+        # Build LLVM function type signature for the indirect call.
+        arg_llvm_types = [CTYPES_LLVM_MAP.get(c, "ptr") for c in arg_ctypes]
+        arg_types_str = ", ".join(arg_llvm_types)
+
+        if ret_ctype == "None":
+            # void return
+            self.body_lines.append(f"  call void ({arg_types_str}) {fn_ptr}({', '.join(compiled_args)})")
+            return "0", "None"
+
+        ret_llvm_t = CTYPES_LLVM_MAP.get(ret_ctype, "ptr")
+        result_reg = self._new_reg()
+        self.body_lines.append(
+            f"  {result_reg} = call {ret_llvm_t} ({arg_types_str}) {fn_ptr}({', '.join(compiled_args)})"
+        )
+        pyx_type = ctypes_to_pyx_type(ret_ctype)
+        coerced_result = self._coerce_from_ctype(result_reg, ret_ctype, ret_llvm_t, node)
+        return coerced_result, pyx_type
+
+    def _coerce_to_ctype(self, value: str, pyx_t: str, ctype: str, node: ast.AST) -> str:
+        """Coerce a PyX LLVM value to the LLVM type expected by a ctypes argument."""
+        target_llvm = CTYPES_LLVM_MAP.get(ctype)
+        if target_llvm is None:
+            raise CompileError(
+                f"ctypes type '{ctype}' is not supported in LLVM lowering",
+                code=_ERR_UNSUPPORTED_TYPE,
+                line=getattr(node, "lineno", None),
+                col=getattr(node, "col_offset", None),
+            )
+        if pyx_t == "int" and ctype in CTYPES_INT_TYPES:
+            if target_llvm == "i64":
+                return value  # i64 → i64, no coercion
+            # Truncate i64 to the narrower integer type
+            reg = self._new_reg()
+            self.body_lines.append(f"  {reg} = trunc i64 {value} to {target_llvm}")
+            return reg
+        if pyx_t == "float" and ctype in CTYPES_FLOAT_TYPES:
+            if target_llvm == "double":
+                return value
+            reg = self._new_reg()
+            self.body_lines.append(f"  {reg} = fptrunc double {value} to float")
+            return reg
+        raise CompileError(
+            f"Cannot coerce PyX type '{pyx_t}' to ctypes '{ctype}'",
+            code=_ERR_TYPE_MISMATCH,
+            line=getattr(node, "lineno", None),
+            col=getattr(node, "col_offset", None),
+        )
+
+    def _coerce_from_ctype(self, value: str, ctype: str, llvm_t: str, node: ast.AST) -> str:
+        """Extend / promote a ctypes LLVM result back to the corresponding PyX type."""
+        if ctype in CTYPES_INT_TYPES and llvm_t != "i64":
+            reg = self._new_reg()
+            self.body_lines.append(f"  {reg} = sext {llvm_t} {value} to i64")
+            return reg
+        if ctype in CTYPES_FLOAT_TYPES and llvm_t == "float":
+            reg = self._new_reg()
+            self.body_lines.append(f"  {reg} = fpext float {value} to double")
+            return reg
+        return value  # already the right LLVM type (e.g. i64 / double / ptr)
+
+    # ------------------------------------------------------------------
 
     def _compile_string_literal(self, value: str) -> str:
         gname = self.ctx.alloc_string(value)
@@ -1070,7 +1341,7 @@ class _FunctionCompiler:
                 signature = self.module.functions[func.id][1]
                 return _CallableTarget(self.ctx.function_symbol(signature), signature.arg_types, signature.return_type)
             imported = self.module.imported_symbols.get(func.id)
-            if imported is not None:
+            if imported is not None and imported.module_name != "ctypes":
                 target_module = self.project.lookup_module(imported.module_name)
                 assert target_module is not None
                 if imported.symbol_name in target_module.functions:
@@ -1079,7 +1350,7 @@ class _FunctionCompiler:
             return None
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
             imported_module = self.module.imported_modules.get(func.value.id)
-            if imported_module is not None:
+            if imported_module is not None and imported_module.module_name != "ctypes":
                 target_module = self.project.lookup_module(imported_module.module_name)
                 assert target_module is not None
                 if func.attr in target_module.functions:
