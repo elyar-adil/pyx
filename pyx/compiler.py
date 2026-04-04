@@ -88,7 +88,7 @@ def llvm_type(py_type: str) -> str:
         return LIST_LLVM_TYPE
     if "." in normalized and "[" not in normalized:
         return _class_type_name(normalized)
-    raise KeyError(py_type)
+    raise CompileError(f"type '{py_type}' cannot be lowered to LLVM IR", code=_ERR_UNSUPPORTED_TYPE)
 
 
 @dataclass
@@ -492,6 +492,14 @@ class _FunctionCompiler:
         if isinstance(node.func, ast.Name) and node.func.id in self.module.classes:
             return self._compile_constructor(self.module.classes[node.func.id][1], node.args, node)
 
+        if isinstance(node.func, ast.Name):
+            imported = self.module.imported_symbols.get(node.func.id)
+            if imported is not None:
+                target_module = self.project.lookup_module(imported.module_name)
+                assert target_module is not None
+                if imported.symbol_name in target_module.classes:
+                    return self._compile_constructor(target_module.classes[imported.symbol_name][1], node.args, node)
+
         if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id in self.module.imported_modules:
             imported_module = self.module.imported_modules[node.func.value.id]
             target_module = self.project.lookup_module(imported_module.module_name)
@@ -544,31 +552,48 @@ class _FunctionCompiler:
 
     def _compile_subscript(self, node: ast.Subscript) -> tuple[str, str]:
         container, container_t = self._compile_expr(node.value)
-        item_t = parse_list_type(container_t)
-        if item_t is None:
-            raise CompileError(f"subscript is only supported for list[T] in LLVM mode, got {container_t}", code=_ERR_UNSUPPORTED_EXPRESSION, line=node.lineno, col=node.col_offset)
         index, index_t = self._compile_expr(node.slice)
-        self._require_assignable(index_t, "int", node, "list index must be int")
-        data_ptr, _, _ = self._extract_list_parts(container)
-        elem_ptr = self._new_reg()
-        elem_val = self._new_reg()
-        self.body_lines.append(f"  {elem_ptr} = getelementptr {llvm_type(item_t)}, ptr {data_ptr}, i64 {index}")
-        self.body_lines.append(f"  {elem_val} = load {llvm_type(item_t)}, ptr {elem_ptr}")
-        return elem_val, item_t
+        self._require_assignable(index_t, "int", node, "index must be int")
+
+        item_t = parse_list_type(container_t)
+        if item_t is not None:
+            data_ptr, _, _ = self._extract_list_parts(container)
+            elem_ptr = self._new_reg()
+            elem_val = self._new_reg()
+            self.body_lines.append(f"  {elem_ptr} = getelementptr {llvm_type(item_t)}, ptr {data_ptr}, i64 {index}")
+            self.body_lines.append(f"  {elem_val} = load {llvm_type(item_t)}, ptr {elem_ptr}")
+            return elem_val, item_t
+
+        if container_t == "str":
+            # Returns a 1-char view into the original string buffer.
+            data_ptr, _ = self._extract_str_parts(container)
+            char_ptr = self._new_reg()
+            self.body_lines.append(f"  {char_ptr} = getelementptr i8, ptr {data_ptr}, i64 {index}")
+            return self._build_str_value(char_ptr, "1"), "str"
+
+        raise CompileError(
+            f"subscript is not supported for '{container_t}' in LLVM mode",
+            code=_ERR_UNSUPPORTED_EXPRESSION,
+            line=node.lineno,
+            col=node.col_offset,
+        )
 
     def _compile_list_literal(self, node: ast.List) -> tuple[str, str]:
         if not node.elts:
             return self._build_list_value("null", "0", "0"), "list[Any]"
-        item_t = self._infer_list_item_type(node)
+        # Single pass: compile all elements first, then determine item type.
+        compiled: list[tuple[str, str]] = [self._compile_expr(elt) for elt in node.elts]
+        item_t = compiled[0][1]
+        for _, t in compiled[1:]:
+            item_t = self._merge_item_type(item_t, t)
         if item_t not in {"int", "float", "bool", "str"}:
             raise CompileError(f"list element type '{item_t}' is not supported in LLVM mode", code=_ERR_UNSUPPORTED_TYPE, line=node.lineno, col=node.col_offset)
         self.ctx.uses_malloc = True
         count = len(node.elts)
         alloc_reg = self._new_reg()
         self.body_lines.append(f"  {alloc_reg} = call ptr @malloc(i64 {count * self._element_size(item_t)})")
-        for index, elt in enumerate(node.elts):
-            value, got_t = self._compile_expr(elt)
-            coerced, _ = self._coerce_value(value, got_t, item_t, elt, "list literal element type mismatch")
+        for index, (value, got_t) in enumerate(compiled):
+            coerced, _ = self._coerce_value(value, got_t, item_t, node.elts[index], "list literal element type mismatch")
             elem_ptr = self._new_reg()
             self.body_lines.append(f"  {elem_ptr} = getelementptr {llvm_type(item_t)}, ptr {alloc_reg}, i64 {index}")
             self.body_lines.append(f"  store {llvm_type(item_t)} {coerced}, ptr {elem_ptr}")
@@ -912,13 +937,6 @@ class _FunctionCompiler:
             return class_info.field_names.index(field_name)
         except ValueError as exc:
             raise CompileError(f"class '{class_info.name}' has no field '{field_name}'", code=_ERR_UNKNOWN_FIELD, line=node.lineno, col=node.col_offset) from exc
-
-    def _infer_list_item_type(self, node: ast.List) -> str:
-        _, item_t = self._compile_expr(node.elts[0])
-        for elt in node.elts[1:]:
-            _, other_t = self._compile_expr(elt)
-            item_t = self._merge_item_type(item_t, other_t)
-        return item_t
 
     def _merge_item_type(self, left: str, right: str) -> str:
         if left == right:

@@ -172,6 +172,9 @@ class Analyzer:
             return
 
         if isinstance(stmt, ast.Expr):
+            if not isinstance(stmt.value, ast.Call):
+                self._error(stmt, _ERR_UNSUPPORTED, "Only function calls are supported as expression statements")
+                return
             self._infer_expr_type(stmt.value, ctx)
             return
 
