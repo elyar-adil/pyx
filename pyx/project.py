@@ -4,6 +4,10 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Modules that are part of Python's standard library or runtime and should not
+# be resolved as local .py files. The compiler handles them via built-in rules.
+BUILTIN_MODULES: frozenset[str] = frozenset({"ctypes"})
+
 
 @dataclass(frozen=True)
 class FunctionSignature:
@@ -115,13 +119,25 @@ def _load_module(path: Path, module_name: str, root_dir: Path, modules: dict[str
         if isinstance(node, ast.Import):
             for alias in node.names:
                 imported = alias.name
+                local = alias.asname or imported
+                if imported in BUILTIN_MODULES:
+                    module.imported_modules[local] = ImportedModule(local_name=local, module_name=imported)
+                    continue
                 imported_path = _resolve_module_path(imported, root_dir)
                 _load_module(imported_path, imported, root_dir, modules)
-                local = alias.asname or imported
                 module.imported_modules[local] = ImportedModule(local_name=local, module_name=imported)
         elif isinstance(node, ast.ImportFrom):
             if node.level != 0 or node.module is None:
                 raise ProjectLoadError(f"relative imports are not supported in {path}")
+            if node.module in BUILTIN_MODULES:
+                for alias in node.names:
+                    local = alias.asname or alias.name
+                    module.imported_symbols[local] = ImportedSymbol(
+                        local_name=local,
+                        module_name=node.module,
+                        symbol_name=alias.name,
+                    )
+                continue
             imported_path = _resolve_module_path(node.module, root_dir)
             _load_module(imported_path, node.module, root_dir, modules)
             for alias in node.names:

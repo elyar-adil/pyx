@@ -6,11 +6,16 @@ from pathlib import Path
 
 from .project import ClassInfo, FunctionSignature, ModuleInfo, ProjectInfo, ProjectLoadError, load_project
 from .type_system import (
+    CDLL_TYPE,
+    CTYPES_ALL_TYPES,
     can_assign_type,
+    ctypes_to_pyx_type,
+    is_cfuncptr_type,
     is_numeric_type,
     is_supported_type,
     merge_numeric_result_type,
     normalize_type_name,
+    parse_cfuncptr_type,
     parse_dict_type,
     parse_list_type,
     parse_set_type,
@@ -351,6 +356,10 @@ class Analyzer:
             if isinstance(node.value, ast.Name):
                 imported_module = ctx.module.imported_modules.get(node.value.id)
                 if imported_module is not None:
+                    # Phase 4: built-in modules (e.g. ctypes) are not in the project
+                    # module registry; their attribute access is handled at call sites.
+                    if imported_module.module_name == "ctypes":
+                        return "Any"
                     target_module = self.project.lookup_module(imported_module.module_name)
                     assert target_module is not None
                     if node.attr in target_module.classes:
@@ -444,6 +453,20 @@ class Analyzer:
                 self._error(node.args[0], _ERR_CALL_ARG_TYPE, f"len() does not support '{arg_t}'")
                 return "int"
 
+        # ------------------------------------------------------------------
+        # Phase 4: ctypes FFI pattern recognition
+        # ------------------------------------------------------------------
+        if self._is_ctypes_call(node.func, "CDLL", ctx):
+            return self._infer_cdll_call(node, ctx)
+        if self._is_ctypes_call(node.func, "CFUNCTYPE", ctx):
+            return self._infer_cfunctype_call(node, ctx)
+        # cfuncptr variable invocation (binding or indirect call)
+        if isinstance(node.func, ast.Name) and node.func.id in ctx.locals:
+            func_t = ctx.locals[node.func.id]
+            if is_cfuncptr_type(func_t):
+                return self._infer_cfuncptr_call(node, func_t, ctx)
+        # ------------------------------------------------------------------
+
         target = self._resolve_callable(node.func, ctx)
         if target is None:
             return "Any"
@@ -473,6 +496,12 @@ class Analyzer:
                 return _CallableTarget(class_info.field_types, class_info.qualified_name, func.id)
             imported = ctx.module.imported_symbols.get(func.id)
             if imported is not None:
+                if imported.module_name == "ctypes":
+                    # ctypes calls are handled before _resolve_callable; if we
+                    # reach here the pattern is unsupported.
+                    self._error(func, _ERR_UNSUPPORTED,
+                                f"Unsupported ctypes call pattern for '{func.id}'")
+                    return None
                 target_module = self.project.lookup_module(imported.module_name)
                 assert target_module is not None
                 if imported.symbol_name in target_module.functions:
@@ -488,6 +517,11 @@ class Analyzer:
             if isinstance(func.value, ast.Name):
                 imported_module = ctx.module.imported_modules.get(func.value.id)
                 if imported_module is not None:
+                    if imported_module.module_name == "ctypes":
+                        # ctypes attribute calls are handled before _resolve_callable.
+                        self._error(func, _ERR_UNSUPPORTED,
+                                    f"Unsupported ctypes call pattern for '{ast.unparse(func)}'")
+                        return None
                     target_module = self.project.lookup_module(imported_module.module_name)
                     assert target_module is not None
                     if func.attr in target_module.functions:
@@ -509,6 +543,110 @@ class Analyzer:
 
         self._error(func, _ERR_UNKNOWN_SYMBOL, f"Unsupported call target '{ast.unparse(func)}'")
         return None
+
+    # ------------------------------------------------------------------
+    # Phase 4 helpers: ctypes FFI
+    # ------------------------------------------------------------------
+
+    def _is_ctypes_call(self, func: ast.AST, attr: str, ctx: _FunctionContext) -> bool:
+        """Return True if *func* refers to ``ctypes.<attr>`` or an imported alias."""
+        if isinstance(func, ast.Attribute) and func.attr == attr and isinstance(func.value, ast.Name):
+            mod = ctx.module.imported_modules.get(func.value.id)
+            if mod is not None and mod.module_name == "ctypes":
+                return True
+        if isinstance(func, ast.Name):
+            sym = ctx.module.imported_symbols.get(func.id)
+            if sym is not None and sym.module_name == "ctypes" and sym.symbol_name == attr:
+                return True
+        return False
+
+    def _resolve_ctypes_type(self, node: ast.AST, ctx: _FunctionContext) -> str | None:
+        """Extract a ctypes type name (e.g. ``"c_int"``) from an AST expression.
+
+        Handles ``ctypes.c_int``, ``c_int`` (after ``from ctypes import``),
+        and ``None`` (meaning void / no return value).
+        Returns *None* if the node is not a recognised ctypes type.
+        """
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            if node.attr in CTYPES_ALL_TYPES:
+                mod = ctx.module.imported_modules.get(node.value.id)
+                if mod is not None and mod.module_name == "ctypes":
+                    return node.attr
+        if isinstance(node, ast.Name):
+            sym = ctx.module.imported_symbols.get(node.id)
+            if sym is not None and sym.module_name == "ctypes" and sym.symbol_name in CTYPES_ALL_TYPES:
+                return sym.symbol_name
+        if isinstance(node, ast.Constant) and node.value is None:
+            return "None"
+        return None
+
+    def _infer_cdll_call(self, node: ast.Call, ctx: _FunctionContext) -> str:
+        """Type-check ``ctypes.CDLL(name)`` and return the internal ``cdll`` type."""
+        if len(node.args) != 1:
+            self._error(node, _ERR_CALL_ARG_COUNT, "CDLL() expects exactly 1 argument (library name)")
+            return CDLL_TYPE
+        arg_t = self._infer_expr_type(node.args[0], ctx)
+        if arg_t not in {"str", "Any"}:
+            self._error(node.args[0], _ERR_CALL_ARG_TYPE, f"CDLL() expects a str library name, got {arg_t}")
+        return CDLL_TYPE
+
+    def _infer_cfunctype_call(self, node: ast.Call, ctx: _FunctionContext) -> str:
+        """Type-check ``ctypes.CFUNCTYPE(restype, *argtypes)`` and return a
+        ``cfuncptr(ret,arg1,...)`` type string."""
+        if not node.args:
+            self._error(node, _ERR_CALL_ARG_COUNT, "CFUNCTYPE() requires at least a return-type argument")
+            return "Any"
+        ret_ctype = self._resolve_ctypes_type(node.args[0], ctx)
+        if ret_ctype is None:
+            self._error(node.args[0], _ERR_UNSUPPORTED,
+                        "CFUNCTYPE() first argument must be a ctypes type or None")
+            ret_ctype = "c_int"
+        arg_ctypes: list[str] = []
+        for i, arg in enumerate(node.args[1:], start=2):
+            ctype = self._resolve_ctypes_type(arg, ctx)
+            if ctype is None:
+                self._error(arg, _ERR_UNSUPPORTED,
+                            f"CFUNCTYPE() argument {i} must be a ctypes type")
+            else:
+                arg_ctypes.append(ctype)
+        inner = ",".join([ret_ctype] + arg_ctypes)
+        return f"cfuncptr({inner})"
+
+    def _infer_cfuncptr_call(self, node: ast.Call, func_t: str, ctx: _FunctionContext) -> str:
+        """Handle calls on a ``cfuncptr(...)`` typed variable.
+
+        Two sub-patterns:
+        * **Binding**: ``fn_type_var(("sym_name", lib_var))`` → dlsym; returns
+          the same ``cfuncptr(...)`` type (the variable now holds a real fn ptr).
+        * **Indirect call**: ``fn_ptr_var(arg1, arg2, ...)`` → returns the
+          promoted PyX return type.
+        """
+        parsed = parse_cfuncptr_type(func_t)
+        if parsed is None:
+            return "Any"
+        ret_ctype, arg_ctypes = parsed
+
+        # Detect the dlsym-binding pattern: fn_type(("sym", lib))
+        if (len(node.args) == 1
+                and isinstance(node.args[0], ast.Tuple)
+                and len(node.args[0].elts) == 2
+                and isinstance(node.args[0].elts[0], ast.Constant)
+                and isinstance(node.args[0].elts[0].value, str)):
+            lib_t = self._infer_expr_type(node.args[0].elts[1], ctx)
+            if lib_t not in {CDLL_TYPE, "Any"}:
+                self._error(node.args[0].elts[1], _ERR_CALL_ARG_TYPE,
+                            f"dlsym binding expects a CDLL handle, got {lib_t}")
+            return func_t  # same cfuncptr type, now bound to dlsym result
+
+        # Indirect function-pointer call
+        if len(node.args) != len(arg_ctypes):
+            self._error(node, _ERR_CALL_ARG_COUNT,
+                        f"Function pointer call expects {len(arg_ctypes)} argument(s), got {len(node.args)}")
+        for arg_node in node.args:
+            self._infer_expr_type(arg_node, ctx)  # validate sub-expressions
+        return ctypes_to_pyx_type(ret_ctype)
+
+    # ------------------------------------------------------------------
 
     def _render_annotation(self, node: ast.AST, module: ModuleInfo) -> str:
         rendered = ast.unparse(node)
