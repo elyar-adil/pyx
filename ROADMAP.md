@@ -7,14 +7,15 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 
 ---
 
-## 当前状态（Phase 2 已完成，Phase 3 核心已落地，Phase 4 基础能力已落地）
+## 当前状态（Phase 2 已完成，Phase 3 核心与基础运行时已落地，Phase 4 基础能力已落地）
 
 - ✅ 静态子集检查器：注解约束、类型稳定性、反射限制、模块感知
-- ✅ LLVM IR 代码生成：`int` / `float` / `bool` / `str` / `list[T]` / `class` struct
+- ✅ LLVM IR 代码生成：`int` / `float` / `bool` / `str` / `bytes` / `list[T]` / `class` struct
 - ✅ 多模块项目：`import` + `from ... import`，跨文件符号解析与链接
+- ✅ 基础文件 I/O：`open()`、`read()`、`write()`、`readline()`、`close()`、`with open(...) as`
 - ✅ `pyx build` 构建产物：`.ll` + 可选 `.o`
 - ✅ Phase 4 基础 FFI：`ctypes.CDLL`、`ctypes.CFUNCTYPE`、`dlsym` 绑定、函数指针间接调用
-- ✅ 68 个自动化测试全部通过
+- ✅ 93 个自动化测试全部通过
 
 ---
 
@@ -36,15 +37,16 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 
 ---
 
-## Phase 3：数据结构与模块系统（🚧 进行中，核心能力已落地）
+## Phase 3：数据结构、模块系统与基础运行时（🚧 进行中，核心能力已落地）
 
 ### 目标
 进入“可用于小型真实项目”的阶段。
 
-### 已落地（2026-04-05，68 个测试全通过）
+### 已落地（2026-04-05，总测试数 93；其中新增 25 个文件 I/O / bytes 回归）
 
 **类型与表达式**
 - ✅ `str` 原生布局（`{ ptr, i64 }`）：字面量、变量、参数、`print`、`len()`、`+` 拼接（`malloc + memcpy`）、`s[i]` 索引（UTF-8 helper）
+- ✅ `bytes` 原生布局（`{ ptr, i64 }`）：字面量、`len()`、二进制文件读写返回值
 - ✅ `list[T]` 原生布局（`{ ptr, i64, i64 }`）：字面量、`len()`、`append()`（`realloc` 扩容）、`xs[i]` 索引、`xs[i] = v`
 - ✅ `class` / `dataclass` -> fixed-layout struct：字段读写（`extractvalue` / `insertvalue`）、方法调用静态分派（`self` 作为第一参数）
 - ✅ `from mod import Cls` 构造函数调用
@@ -53,6 +55,12 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 - ✅ `import mod` 和 `from mod import sym`（函数 + 类）
 - ✅ 跨模块 analyzer：符号解析、类型推断、方法签名验证
 - ✅ 跨模块 compiler：函数符号 mangling（`@mod_X__fn`）、类类型 mangling（`%type.X__Cls`）
+
+**基础运行时 / I/O**
+- ✅ `open(name, mode)` 区分 `TextFile` / `BinaryFile`
+- ✅ 文本文件：`read()` / `readline()` / `write()` / `close()`
+- ✅ 二进制文件：`read()` / `write()` / `close()`
+- ✅ `with open(...) as fp:` 上下文管理器 lowering（单项 `with`）
 
 **正确性与工程行为**
 - ✅ `_compile_list_literal` 消除双重编译（避免重复 IR 指令）
@@ -68,7 +76,9 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 | `str` 比较（`==`, `!=`） | ❌ | 当前会显式报“planned but not lowered”，尚未接入 `memcmp` |
 | `dict[K, V]` LLVM lowering | ❌ | Analyzer 已支持类型推断；Compiler 尚未实现哈希表布局与操作 |
 | `set[T]` LLVM lowering | ❌ | Analyzer 可推断类型；Compiler 明确拦截 |
-| `bytes` LLVM lowering | ❌ | Analyzer 已识别；Compiler 明确拦截 |
+| `bytes` 扩展操作（索引 / 切片 / 比较） | ❌ | 当前只覆盖字面量、`len()` 与二进制文件 I/O 主路径 |
+| 更完整文件 API（`seek` / `tell` / 迭代 / 追加语义） | ❌ | 当前只覆盖 `read` / `readline` / `write` / `close` |
+| 动态 `open()` mode lowering | ❌ | compiler 当前要求 mode 为字符串字面量 |
 | 除法（`/`, `//`, `%`） | ❌ | 需要 `sdiv` / `fdiv` / `srem`，以及除零语义设计 |
 | `break` / `continue` | ❌ | 需要维护循环跳转标签栈 |
 | ARC 内存管理 | ❌ | 当前 `str` 拼接、`list` 扩容等 heap 分配尚未释放 |
@@ -79,6 +89,7 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 - 支持包含多模块、`list[T]` / `class` / `str` 操作的完整示例项目编译并运行。
 - `dict[K, V]` 基础操作（set / get）端到端通过。
 - 为 heap 值建立明确的所有权/释放策略，不再长期依赖“只分配不释放”。
+- 文件 I/O 从“可用”推进到“可写真实脚本”的完整运行时子集。
 
 ---
 
