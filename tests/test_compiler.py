@@ -9,6 +9,13 @@ def write_tmp(tmp_path: Path, code: str) -> Path:
     return p
 
 
+def write_project(tmp_path: Path, files: dict[str, str]) -> Path:
+    for name, code in files.items():
+        path = tmp_path / name
+        path.write_text(code, encoding="utf-8")
+    return tmp_path / "main.py"
+
+
 def test_compile_recursive_function_to_llvm_ir(tmp_path: Path) -> None:
     src = write_tmp(
         tmp_path,
@@ -208,3 +215,64 @@ def widen(x: int) -> float:
     ir = LLVMCompiler.from_path(src).compile_ir()
     assert "sitofp i64" in ir
     assert "fadd double" in ir
+
+
+def test_compile_imported_class_method_lowering(tmp_path: Path) -> None:
+    src = write_project(
+        tmp_path,
+        {
+            "geom.py": """
+class Point:
+    x: int
+    y: int
+
+    def total(self) -> int:
+        return self.x + self.y
+""",
+            "main.py": """
+import geom
+
+def run(n: int) -> int:
+    p = geom.Point(n, 2)
+    return p.total()
+""",
+        },
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "%type.geom__Point = type { i64, i64 }" in ir
+    assert "define i64 @mod_geom__Point__total(%type.geom__Point %self)" in ir
+    assert "call i64 @mod_geom__Point__total" in ir
+
+
+def test_compile_list_append_and_index_lowering(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run(n: int) -> int:
+    xs = [n, 2]
+    xs.append(3)
+    return xs[1]
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "%pyx.list = type { ptr, i64, i64 }" in ir
+    assert "call ptr @realloc" in ir
+    assert "getelementptr i64" in ir
+    assert "extractvalue %pyx.list" in ir
+
+
+def test_compile_string_concat_lowering(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run() -> str:
+    a = "he"
+    b = "llo"
+    return a + b
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "%pyx.str = type { ptr, i64 }" in ir
+    assert "declare ptr @malloc(i64)" in ir
+    assert "declare ptr @memcpy(ptr, ptr, i64)" in ir
+    assert "insertvalue %pyx.str" in ir
