@@ -8,12 +8,13 @@ from pathlib import Path
 class Diagnostic:
     code: str
     message: str
+    path: str | Path | None = None
     line: int | None = None
     col: int | None = None
 
 
 def format_diagnostic(source: str | Path, diagnostic: Diagnostic) -> str:
-    path = str(source)
+    path = str(diagnostic.path or source)
     if diagnostic.line is None:
         return f"{path}: error[{diagnostic.code}]: {diagnostic.message}"
     return (

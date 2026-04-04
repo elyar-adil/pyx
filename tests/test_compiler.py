@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pyx.compiler import LLVMCompiler
+from pyx.compiler import CompileError, LLVMCompiler
 
 
 def write_tmp(tmp_path: Path, code: str) -> Path:
@@ -379,3 +379,80 @@ def run() -> str:
     assert "declare ptr @malloc(i64)" in ir
     assert "declare ptr @memcpy(ptr, ptr, i64)" in ir
     assert "insertvalue %pyx.str" in ir
+
+
+def test_compile_utf8_len_uses_helper(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run() -> int:
+    return len("你")
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "define private i64 @__pyx_utf8_len(ptr %data, i64 %nbytes)" in ir
+    assert "call i64 @__pyx_utf8_len(ptr" in ir
+
+
+def test_compile_utf8_index_uses_helper(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run(s: str) -> str:
+    return s[0]
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "define private %pyx.str @__pyx_utf8_index(ptr %data, i64 %nbytes, i64 %index)" in ir
+    assert "declare void @abort()" in ir
+    assert "call %pyx.str @__pyx_utf8_index" in ir
+
+
+def test_compile_list_item_assignment_lowering(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run() -> int:
+    xs = [1, 2]
+    xs[0] = 3
+    return xs[0]
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "declare void @abort()" in ir
+    assert "getelementptr i64" in ir
+    assert "store i64 3" in ir
+
+
+def test_set_type_reports_planned_not_lowered(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run(xs: set[int]) -> int:
+    return 0
+""",
+    )
+    try:
+        LLVMCompiler.from_path(src).compile_ir()
+    except CompileError as exc:
+        assert exc.code == "PYX2002"
+        assert "planned but not lowered" in exc.message
+    else:
+        raise AssertionError("expected CompileError")
+
+
+def test_string_compare_reports_planned_not_lowered(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run(a: str, b: str) -> bool:
+    return a == b
+""",
+    )
+    try:
+        LLVMCompiler.from_path(src).compile_ir()
+    except CompileError as exc:
+        assert exc.code == "PYX2002"
+        assert "string comparison" in exc.message
+    else:
+        raise AssertionError("expected CompileError")

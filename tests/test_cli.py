@@ -72,3 +72,48 @@ def run(n: int) -> int:
     assert rc == 0
     assert "Build artifacts written" in out
     assert "@mod_geom__Point__total" in ir
+
+
+def test_cmd_check_reports_imported_module_path(tmp_path: Path, capsys) -> None:
+    src = write_project(
+        tmp_path,
+        {
+            "mod.py": """
+def bad(x) -> int:
+    return x
+""",
+            "main.py": """
+import mod
+
+def ok() -> int:
+    return 1
+""",
+        },
+    )
+    rc = cmd_check(src)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert str(tmp_path / "mod.py") in out
+
+
+def test_cmd_build_reports_imported_module_compile_path(tmp_path: Path, capsys) -> None:
+    src = write_project(
+        tmp_path,
+        {
+            "mod.py": """
+def bad(xs: set[int]) -> int:
+    return 1
+""",
+            "main.py": """
+import mod
+
+def ok() -> int:
+    return 1
+""",
+        },
+    )
+    rc = cmd_build(src, tmp_path / "dist")
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert str(tmp_path / "mod.py") in out
+    assert "planned but not lowered" in out

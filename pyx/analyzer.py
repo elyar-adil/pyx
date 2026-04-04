@@ -36,6 +36,7 @@ _ERR_UNKNOWN_TYPE = "PYX1015"
 class AnalysisError:
     code: str
     message: str
+    path: str | Path | None
     line: int | None
     col: int | None
 
@@ -62,13 +63,14 @@ class Analyzer:
     def __init__(self) -> None:
         self.errors: list[AnalysisError] = []
         self.project: ProjectInfo | None = None
+        self._current_module_path: Path | None = None
 
     def analyze_path(self, file_path: str | Path) -> list[AnalysisError]:
         self.errors = []
         try:
             self.project = load_project(file_path)
         except ProjectLoadError as exc:
-            self.errors.append(AnalysisError(code=_ERR_IMPORT, message=str(exc), line=None, col=None))
+            self.errors.append(AnalysisError(code=_ERR_IMPORT, message=str(exc), path=file_path, line=None, col=None))
             return self.errors
 
         assert self.project is not None
@@ -77,6 +79,7 @@ class Analyzer:
         return self.errors
 
     def _analyze_module(self, module: ModuleInfo) -> None:
+        self._current_module_path = module.path
         for _, (fn_node, signature) in module.functions.items():
             self._analyze_function(module, fn_node, signature)
 
@@ -540,6 +543,7 @@ class Analyzer:
             AnalysisError(
                 code=code,
                 message=message,
+                path=self._current_module_path,
                 line=getattr(node, "lineno", None),
                 col=getattr(node, "col_offset", None),
             )

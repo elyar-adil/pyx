@@ -17,6 +17,7 @@ from .type_system import (
     normalize_type_name,
     parse_dict_type,
     parse_list_type,
+    parse_set_type,
 )
 
 TYPE_MAP = {"int": "i64", "float": "double", "bool": "i1"}
@@ -95,6 +96,7 @@ def llvm_type(py_type: str) -> str:
 class CompileError(Exception):
     message: str
     code: str = _ERR_UNSUPPORTED_EXPRESSION
+    path: str | Path | None = None
     line: int | None = None
     col: int | None = None
 
@@ -119,6 +121,8 @@ class _ModuleContext:
         self.uses_malloc = False
         self.uses_realloc = False
         self.uses_memcpy = False
+        self.uses_abort = False
+        self.uses_utf8_helpers = False
         self._str_by_value: dict[str, str] = {}
         self._str_globals: list[tuple[str, str]] = []
 
@@ -139,6 +143,8 @@ class _ModuleContext:
         return f"@mod_{_mangle_path(signature.module_name)}__{signature.name}"
 
     def emit_preamble(self) -> list[str]:
+        if self.uses_utf8_helpers:
+            self.uses_abort = True
         lines = [
             f"{STR_LLVM_TYPE} = type {{ ptr, i64 }}",
             f"{LIST_LLVM_TYPE} = type {{ ptr, i64, i64 }}",
@@ -164,9 +170,86 @@ class _ModuleContext:
             lines.append("declare ptr @realloc(ptr, i64)")
         if self.uses_memcpy:
             lines.append("declare ptr @memcpy(ptr, ptr, i64)")
-        if self.uses_printf or self.uses_malloc or self.uses_realloc or self.uses_memcpy:
+        if self.uses_abort:
+            lines.append("declare void @abort()")
+        if self.uses_printf or self.uses_malloc or self.uses_realloc or self.uses_memcpy or self.uses_abort:
             lines.append("")
+        if self.uses_utf8_helpers:
+            lines.extend(self._emit_utf8_helpers())
         return lines
+
+    def _emit_utf8_helpers(self) -> list[str]:
+        self.uses_abort = True
+        return [
+            "define private i64 @__pyx_utf8_char_width(i8 %byte) {",
+            "entry:",
+            "  %b = zext i8 %byte to i32",
+            "  %is_ascii = icmp ult i32 %b, 128",
+            "  br i1 %is_ascii, label %ret1, label %check2",
+            "check2:",
+            "  %is_2 = icmp ult i32 %b, 224",
+            "  br i1 %is_2, label %ret2, label %check3",
+            "check3:",
+            "  %is_3 = icmp ult i32 %b, 240",
+            "  br i1 %is_3, label %ret3, label %ret4",
+            "ret1:",
+            "  ret i64 1",
+            "ret2:",
+            "  ret i64 2",
+            "ret3:",
+            "  ret i64 3",
+            "ret4:",
+            "  ret i64 4",
+            "}",
+            "",
+            "define private i64 @__pyx_utf8_len(ptr %data, i64 %nbytes) {",
+            "entry:",
+            "  br label %loop",
+            "loop:",
+            "  %offset = phi i64 [0, %entry], [%next_offset, %step]",
+            "  %count = phi i64 [0, %entry], [%next_count, %step]",
+            "  %done = icmp eq i64 %offset, %nbytes",
+            "  br i1 %done, label %exit, label %step",
+            "step:",
+            "  %ptr = getelementptr i8, ptr %data, i64 %offset",
+            "  %byte = load i8, ptr %ptr",
+            "  %width = call i64 @__pyx_utf8_char_width(i8 %byte)",
+            "  %next_offset = add i64 %offset, %width",
+            "  %next_count = add i64 %count, 1",
+            "  br label %loop",
+            "exit:",
+            "  ret i64 %count",
+            "}",
+            "",
+            f"define private {STR_LLVM_TYPE} @__pyx_utf8_index(ptr %data, i64 %nbytes, i64 %index) {{",
+            "entry:",
+            "  %negative = icmp slt i64 %index, 0",
+            "  br i1 %negative, label %trap, label %loop",
+            "loop:",
+            "  %offset = phi i64 [0, %entry], [%next_offset, %advance]",
+            "  %count = phi i64 [0, %entry], [%next_count, %advance]",
+            "  %done = icmp eq i64 %offset, %nbytes",
+            "  br i1 %done, label %trap, label %body",
+            "body:",
+            "  %ptr = getelementptr i8, ptr %data, i64 %offset",
+            "  %byte = load i8, ptr %ptr",
+            "  %width = call i64 @__pyx_utf8_char_width(i8 %byte)",
+            "  %match = icmp eq i64 %count, %index",
+            "  br i1 %match, label %ret, label %advance",
+            "advance:",
+            "  %next_offset = add i64 %offset, %width",
+            "  %next_count = add i64 %count, 1",
+            "  br label %loop",
+            "ret:",
+            f"  %str0 = insertvalue {STR_LLVM_TYPE} undef, ptr %ptr, 0",
+            f"  %str1 = insertvalue {STR_LLVM_TYPE} %str0, i64 %width, 1",
+            f"  ret {STR_LLVM_TYPE} %str1",
+            "trap:",
+            "  call void @abort()",
+            "  unreachable",
+            "}",
+            "",
+        ]
 
 
 class _FunctionCompiler:
@@ -190,25 +273,30 @@ class _FunctionCompiler:
         self.slot_types: dict[str, str] = {}
 
     def compile(self) -> list[str]:
-        arg_sig: list[str] = []
-        for arg_name, arg_t in zip(self.signature.arg_names, self.signature.arg_types, strict=True):
-            self._ensure_supported_type(arg_t, self.node)
-            arg_sig.append(f"{llvm_type(arg_t)} %{arg_name}")
-            self._ensure_slot(arg_name, arg_t)
-            self.body_lines.append(f"  store {llvm_type(arg_t)} %{arg_name}, ptr %{arg_name}.slot")
+        try:
+            arg_sig: list[str] = []
+            for arg_name, arg_t in zip(self.signature.arg_names, self.signature.arg_types, strict=True):
+                self._ensure_supported_type(arg_t, self.node)
+                arg_sig.append(f"{llvm_type(arg_t)} %{arg_name}")
+                self._ensure_slot(arg_name, arg_t)
+                self.body_lines.append(f"  store {llvm_type(arg_t)} %{arg_name}, ptr %{arg_name}.slot")
 
-        ret_t = self.signature.return_type
-        self._ensure_supported_type(ret_t, self.node)
-        header = [f"define {llvm_type(ret_t)} {self.ctx.function_symbol(self.signature)}({', '.join(arg_sig)}) {{", "entry:"]
-        terminated = self._compile_statements(self.node.body, ret_t)
-        if not terminated:
-            raise CompileError(
-                f"Function '{self.node.name}' must explicitly return on all paths for LLVM lowering",
-                code=_ERR_MISSING_RETURN,
-                line=self.node.lineno,
-                col=self.node.col_offset,
-            )
-        return header + self.entry_lines + self.body_lines + ["}"]
+            ret_t = self.signature.return_type
+            self._ensure_supported_type(ret_t, self.node)
+            header = [f"define {llvm_type(ret_t)} {self.ctx.function_symbol(self.signature)}({', '.join(arg_sig)}) {{", "entry:"]
+            terminated = self._compile_statements(self.node.body, ret_t)
+            if not terminated:
+                raise CompileError(
+                    f"Function '{self.node.name}' must explicitly return on all paths for LLVM lowering",
+                    code=_ERR_MISSING_RETURN,
+                    line=self.node.lineno,
+                    col=self.node.col_offset,
+                )
+            return header + self.entry_lines + self.body_lines + ["}"]
+        except CompileError as exc:
+            if exc.path is None:
+                exc.path = self.module.path
+            raise
 
     def _compile_statements(self, body: list[ast.stmt], expected_ret: str) -> bool:
         for stmt in body:
@@ -343,6 +431,23 @@ class _FunctionCompiler:
             self.body_lines.append(f"  store {llvm_type(owner_t)} {updated}, ptr %{owner_name}.slot")
             return
 
+        if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+            list_name = target.value.id
+            list_t = self.slot_types.get(list_name)
+            item_t = None if list_t is None else parse_list_type(list_t)
+            if item_t is not None:
+                list_val = self._new_reg()
+                self.body_lines.append(f"  {list_val} = load {LIST_LLVM_TYPE}, ptr %{list_name}.slot")
+                data_ptr, length, _ = self._extract_list_parts(list_val)
+                index, index_t = self._compile_expr(target.slice)
+                self._require_assignable(index_t, "int", target, "list assignment index must be int")
+                self._emit_bounds_check(index, length, "list_index")
+                coerced, _ = self._coerce_value(value, ty, item_t, node, "list assignment type mismatch")
+                elem_ptr = self._new_reg()
+                self.body_lines.append(f"  {elem_ptr} = getelementptr {llvm_type(item_t)}, ptr {data_ptr}, i64 {index}")
+                self.body_lines.append(f"  store {llvm_type(item_t)} {coerced}, ptr {elem_ptr}")
+                return
+
         raise CompileError("unsupported assignment target", code=_ERR_UNSUPPORTED_STATEMENT, line=node.lineno, col=node.col_offset)
 
     def _compile_print(self, node: ast.Call) -> None:
@@ -387,6 +492,13 @@ class _FunctionCompiler:
                 return (str(node.value), "float")
             if isinstance(node.value, str):
                 return self._compile_string_literal(node.value), "str"
+            if isinstance(node.value, bytes):
+                raise CompileError(
+                    "type 'bytes' is planned but not lowered in LLVM mode yet",
+                    code=_ERR_UNSUPPORTED_TYPE,
+                    line=node.lineno,
+                    col=node.col_offset,
+                )
 
         if isinstance(node, ast.Name):
             if node.id not in self.slot_types:
@@ -421,6 +533,22 @@ class _FunctionCompiler:
 
         if isinstance(node, ast.List):
             return self._compile_list_literal(node)
+
+        if isinstance(node, ast.Set):
+            raise CompileError(
+                "type 'set[T]' is planned but not lowered in LLVM mode yet",
+                code=_ERR_UNSUPPORTED_TYPE,
+                line=node.lineno,
+                col=node.col_offset,
+            )
+
+        if isinstance(node, ast.Dict):
+            raise CompileError(
+                "type 'dict[K,V]' is planned but not lowered in LLVM mode yet",
+                code=_ERR_UNSUPPORTED_TYPE,
+                line=node.lineno,
+                col=node.col_offset,
+            )
 
         if isinstance(node, ast.Attribute):
             owner, owner_t = self._compile_expr(node.value)
@@ -461,6 +589,13 @@ class _FunctionCompiler:
                 reg = self._new_reg()
                 self.body_lines.append(f"  {reg} = icmp {pred} i1 {left}, {right}")
                 return reg, "bool"
+            if left_t == right_t == "str" and isinstance(op, (ast.Eq, ast.NotEq)):
+                raise CompileError(
+                    "string comparison is planned but not lowered in LLVM mode yet",
+                    code=_ERR_UNSUPPORTED_TYPE,
+                    line=node.lineno,
+                    col=node.col_offset,
+                )
             if is_numeric_type(left_t) and is_numeric_type(right_t):
                 return self._compile_numeric_compare(left, left_t, right, right_t, node, op), "bool"
             raise CompileError("comparison type not supported", code=_ERR_TYPE_MISMATCH, line=node.lineno, col=node.col_offset)
@@ -479,8 +614,11 @@ class _FunctionCompiler:
                 raise CompileError("len() expects exactly one argument", code=_ERR_CALL_ARG_COUNT, line=node.lineno, col=node.col_offset)
             value, value_t = self._compile_expr(node.args[0])
             if value_t == "str":
-                _, length = self._extract_str_parts(value)
-                return length, "int"
+                self.ctx.uses_utf8_helpers = True
+                data_ptr, byte_length = self._extract_str_parts(value)
+                reg = self._new_reg()
+                self.body_lines.append(f"  {reg} = call i64 @__pyx_utf8_len(ptr {data_ptr}, i64 {byte_length})")
+                return reg, "int"
             if parse_list_type(value_t) is not None:
                 _, length, _ = self._extract_list_parts(value)
                 return length, "int"
@@ -557,7 +695,8 @@ class _FunctionCompiler:
 
         item_t = parse_list_type(container_t)
         if item_t is not None:
-            data_ptr, _, _ = self._extract_list_parts(container)
+            data_ptr, length, _ = self._extract_list_parts(container)
+            self._emit_bounds_check(index, length, "list_index")
             elem_ptr = self._new_reg()
             elem_val = self._new_reg()
             self.body_lines.append(f"  {elem_ptr} = getelementptr {llvm_type(item_t)}, ptr {data_ptr}, i64 {index}")
@@ -565,11 +704,11 @@ class _FunctionCompiler:
             return elem_val, item_t
 
         if container_t == "str":
-            # Returns a 1-char view into the original string buffer.
-            data_ptr, _ = self._extract_str_parts(container)
-            char_ptr = self._new_reg()
-            self.body_lines.append(f"  {char_ptr} = getelementptr i8, ptr {data_ptr}, i64 {index}")
-            return self._build_str_value(char_ptr, "1"), "str"
+            self.ctx.uses_utf8_helpers = True
+            data_ptr, byte_length = self._extract_str_parts(container)
+            reg = self._new_reg()
+            self.body_lines.append(f"  {reg} = call {STR_LLVM_TYPE} @__pyx_utf8_index(ptr {data_ptr}, i64 {byte_length}, i64 {index})")
+            return reg, "str"
 
         raise CompileError(
             f"subscript is not supported for '{container_t}' in LLVM mode",
@@ -902,8 +1041,24 @@ class _FunctionCompiler:
     def _ensure_supported_type(self, ty: str, node: ast.AST) -> None:
         if not is_supported_type(ty, self.project.known_type_names()):
             raise CompileError(f"type '{ty}' is not supported", code=_ERR_UNSUPPORTED_TYPE, line=node.lineno, col=node.col_offset)
-        if ty == "bytes" or parse_dict_type(ty) is not None:
+        if ty == "bytes" or parse_dict_type(ty) is not None or parse_set_type(ty) is not None:
             raise CompileError(f"type '{ty}' is planned but not lowered in LLVM mode yet", code=_ERR_UNSUPPORTED_TYPE, line=node.lineno, col=node.col_offset)
+
+    def _emit_bounds_check(self, index: str, length: str, prefix: str) -> None:
+        self.ctx.uses_abort = True
+        negative = self._new_reg()
+        too_large = self._new_reg()
+        out_of_bounds = self._new_reg()
+        trap_label = self._new_label(f"{prefix}_trap")
+        ok_label = self._new_label(f"{prefix}_ok")
+        self.body_lines.append(f"  {negative} = icmp slt i64 {index}, 0")
+        self.body_lines.append(f"  {too_large} = icmp sge i64 {index}, {length}")
+        self.body_lines.append(f"  {out_of_bounds} = or i1 {negative}, {too_large}")
+        self.body_lines.append(f"  br i1 {out_of_bounds}, label %{trap_label}, label %{ok_label}")
+        self.body_lines.append(f"{trap_label}:")
+        self.body_lines.append("  call void @abort()")
+        self.body_lines.append("  unreachable")
+        self.body_lines.append(f"{ok_label}:")
 
     def _require_assignable(self, got: str, expected: str, node: ast.AST, msg: str) -> None:
         if not can_assign_type(got, expected):
@@ -976,7 +1131,7 @@ class LLVMCompiler:
         try:
             project = load_project(source)
         except ProjectLoadError as exc:
-            raise CompileError(str(exc), code=_ERR_PROJECT) from exc
+            raise CompileError(str(exc), code=_ERR_PROJECT, path=Path(source)) from exc
         return cls(project)
 
     def compile_ir(self) -> str:
@@ -989,12 +1144,19 @@ class LLVMCompiler:
                     if isinstance(stmt, ast.FunctionDef):
                         functions.append((module, stmt, class_info.methods[stmt.name]))
         if not functions:
-            raise CompileError("no top-level functions found to compile", code=_ERR_UNSUPPORTED_STATEMENT)
+            raise CompileError("no top-level functions found to compile", code=_ERR_UNSUPPORTED_STATEMENT, path=self.project.entry_path)
 
         ctx = _ModuleContext(self.project, self.project.entry_path.stem)
         chunks = ["; ModuleID = 'pyx'", 'source_filename = "pyx"', ""]
-        compiled_functions = [_FunctionCompiler(module, fn_node, signature, self.project, ctx).compile() for module, fn_node, signature in functions]
-        chunks.extend(ctx.emit_preamble())
+        compiled_functions: list[list[str]] = []
+        for module, fn_node, signature in functions:
+            compiled_functions.append(_FunctionCompiler(module, fn_node, signature, self.project, ctx).compile())
+        try:
+            chunks.extend(ctx.emit_preamble())
+        except CompileError as exc:
+            if exc.path is None:
+                exc.path = self.project.entry_path
+            raise
         for fn_lines in compiled_functions:
             chunks.extend(fn_lines)
             chunks.append("")

@@ -14,7 +14,7 @@ def cmd_check(source: Path) -> int:
     errors = analyzer.analyze_path(source)
     if errors:
         for err in errors:
-            print(format_diagnostic(source, Diagnostic(err.code, err.message, err.line, err.col)))
+            print(format_diagnostic(source, Diagnostic(err.code, err.message, err.path, err.line, err.col)))
         return 1
     print(f"{source}: OK")
     return 0
@@ -29,7 +29,7 @@ def cmd_build(source: Path, out_dir: Path) -> int:
         compiler = LLVMCompiler.from_path(source)
         llvm_ir = compiler.compile_ir()
     except CompileError as exc:
-        print(format_diagnostic(source, Diagnostic(exc.code, exc.message, exc.line, exc.col)))
+        print(format_diagnostic(source, Diagnostic(exc.code, exc.message, exc.path, exc.line, exc.col)))
         return 1
 
     out_dir.mkdir(parents=True, exist_ok=True)
