@@ -6,8 +6,11 @@ from pathlib import Path
 
 from .project import ClassInfo, FunctionSignature, ModuleInfo, ProjectInfo, ProjectLoadError, load_project
 from .type_system import (
+    BIN_FILE_TYPE,
     CDLL_TYPE,
     CTYPES_ALL_TYPES,
+    FILE_TYPES,
+    TEXT_FILE_TYPE,
     can_assign_type,
     ctypes_to_pyx_type,
     is_cfuncptr_type,
@@ -204,6 +207,10 @@ class Analyzer:
                 self._error(stmt.test, _ERR_CALL_ARG_TYPE, f"while condition expects bool, got {test_t}")
             loop_ctx = _FunctionContext(ctx.module, ctx.signature, ctx.locals.copy())
             self._check_block(stmt.body, loop_ctx)
+            return
+
+        if isinstance(stmt, ast.With):
+            self._check_with_stmt(stmt, ctx)
             return
 
         self._error(stmt, _ERR_UNSUPPORTED, f"Unsupported statement '{stmt.__class__.__name__}'")
@@ -453,6 +460,9 @@ class Analyzer:
                 self._error(node.args[0], _ERR_CALL_ARG_TYPE, f"len() does not support '{arg_t}'")
                 return "int"
 
+            if name == "open":
+                return self._infer_open_call(node, ctx)
+
         # ------------------------------------------------------------------
         # Phase 4: ctypes FFI pattern recognition
         # ------------------------------------------------------------------
@@ -535,6 +545,9 @@ class Analyzer:
             list_item = parse_list_type(owner_t)
             if list_item is not None and func.attr == "append":
                 return _CallableTarget((list_item,), "None", f"{owner_t}.append")
+
+            if owner_t in FILE_TYPES:
+                return self._resolve_file_method(owner_t, func.attr, func)
 
             class_info = self.project.lookup_class(owner_t)
             if class_info is not None and func.attr in class_info.methods:
@@ -645,6 +658,77 @@ class Analyzer:
         for arg_node in node.args:
             self._infer_expr_type(arg_node, ctx)  # validate sub-expressions
         return ctypes_to_pyx_type(ret_ctype)
+
+    # ------------------------------------------------------------------
+    # File I/O helpers
+    # ------------------------------------------------------------------
+
+    def _infer_open_call(self, node: ast.Call, ctx: _FunctionContext) -> str:
+        """Type-check ``open(filename, mode)`` and return TextFile or BinaryFile."""
+        if len(node.args) < 1 or len(node.args) > 2:
+            self._error(node, _ERR_CALL_ARG_COUNT,
+                        f"open() expects 1 or 2 arguments, got {len(node.args)}")
+            return TEXT_FILE_TYPE
+        filename_t = self._infer_expr_type(node.args[0], ctx)
+        if filename_t not in {"str", "Any"}:
+            self._error(node.args[0], _ERR_CALL_ARG_TYPE,
+                        f"open() filename must be str, got {filename_t}")
+        mode = "r"
+        if len(node.args) == 2:
+            if isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
+                mode = node.args[1].value
+            else:
+                mode_t = self._infer_expr_type(node.args[1], ctx)
+                if mode_t not in {"str", "Any"}:
+                    self._error(node.args[1], _ERR_CALL_ARG_TYPE,
+                                f"open() mode must be str, got {mode_t}")
+        return BIN_FILE_TYPE if "b" in mode else TEXT_FILE_TYPE
+
+    def _resolve_file_method(self, file_t: str, attr: str, node: ast.AST) -> _CallableTarget | None:
+        """Return a CallableTarget for a method on TextFile or BinaryFile."""
+        if file_t == TEXT_FILE_TYPE:
+            if attr == "read":
+                return _CallableTarget((), "str", "TextFile.read")
+            if attr == "readline":
+                return _CallableTarget((), "str", "TextFile.readline")
+            if attr == "readlines":
+                return _CallableTarget((), "list[str]", "TextFile.readlines")
+            if attr == "write":
+                return _CallableTarget(("str",), "int", "TextFile.write")
+            if attr == "close":
+                return _CallableTarget((), "None", "TextFile.close")
+        elif file_t == BIN_FILE_TYPE:
+            if attr == "read":
+                return _CallableTarget((), "bytes", "BinaryFile.read")
+            if attr == "write":
+                return _CallableTarget(("bytes",), "int", "BinaryFile.write")
+            if attr == "close":
+                return _CallableTarget((), "None", "BinaryFile.close")
+        self._error(node, _ERR_UNKNOWN_FIELD, f"{file_t} has no method '{attr}'")
+        return None
+
+    def _check_with_stmt(self, stmt: ast.With, ctx: _FunctionContext) -> None:
+        """Validate ``with open(...) as f:`` statements."""
+        if len(stmt.items) != 1:
+            self._error(stmt, _ERR_UNSUPPORTED,
+                        "only single-item with statements are supported")
+            return
+        item = stmt.items[0]
+        if not (isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+                and item.context_expr.func.id == "open"):
+            self._error(stmt, _ERR_UNSUPPORTED,
+                        "with statement is only supported for open()")
+            return
+        file_t = self._infer_open_call(item.context_expr, ctx)
+        if item.optional_vars is not None:
+            if isinstance(item.optional_vars, ast.Name):
+                ctx.locals[item.optional_vars.id] = file_t
+            else:
+                self._error(stmt, _ERR_UNSUPPORTED,
+                            "with statement target must be a simple name")
+                return
+        self._check_block(stmt.body, ctx)
 
     # ------------------------------------------------------------------
 
