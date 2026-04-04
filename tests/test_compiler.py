@@ -197,6 +197,56 @@ def add_one(x: int | float) -> int | float:
     assert "phi i1" in ir
 
 
+def test_not_equal_comparison(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def neq(a: int, b: int) -> bool:
+    return a != b
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "icmp ne i64" in ir
+
+
+def test_unary_not(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def flip(b: bool) -> bool:
+    return not b
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "xor i1" in ir
+
+
+def test_unary_negate_int(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def neg(n: int) -> int:
+    return -n
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "sub i64 0," in ir
+
+
+def test_ann_assign_in_compiler(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def f(n: int) -> int:
+    x: int = n + 1
+    return x
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "store i64" in ir
+    assert "%x.slot" in ir
+
+
 def test_compile_mixed_numeric_arithmetic_to_float(tmp_path: Path) -> None:
     src = write_tmp(
         tmp_path,

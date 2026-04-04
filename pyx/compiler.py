@@ -178,6 +178,26 @@ class _FunctionCompiler:
                 self.body_lines.append(f"  store {llvm_type(self.slot_types[name])} {coerced}, ptr %{name}.slot")
                 continue
 
+            if isinstance(stmt, ast.AnnAssign):
+                if not isinstance(stmt.target, ast.Name):
+                    raise CompileError(
+                        "only simple name annotation is supported",
+                        code=_ERR_UNSUPPORTED_STATEMENT,
+                        line=stmt.lineno,
+                        col=stmt.col_offset,
+                    )
+                name = stmt.target.id
+                ann_ty = self._annotation_to_type(stmt.annotation, stmt, f"annotated variable '{name}'")
+                if stmt.value is not None:
+                    value, value_ty = self._compile_expr(stmt.value)
+                    if name not in self.slot_types:
+                        self._ensure_slot(name, ann_ty)
+                    coerced, _ = self._coerce_value(value, value_ty, self.slot_types[name], stmt, f"annotated assignment type mismatch for '{name}'")
+                    self.body_lines.append(f"  store {llvm_type(self.slot_types[name])} {coerced}, ptr %{name}.slot")
+                else:
+                    self._ensure_slot(name, ann_ty)
+                continue
+
             if isinstance(stmt, ast.If):
                 cond, cond_t = self._compile_expr(stmt.test)
                 self._require_assignable(cond_t, "bool", stmt, "if condition must be bool")
@@ -297,6 +317,29 @@ class _FunctionCompiler:
             self.body_lines.append(f"  {reg} = load {llvm_type(ty)}, ptr %{node.id}.slot")
             return reg, ty
 
+        if isinstance(node, ast.UnaryOp):
+            operand, ty = self._compile_expr(node.operand)
+            if isinstance(node.op, ast.Not):
+                self._require_assignable(ty, "bool", node, "unary 'not' requires bool operand")
+                reg = self._new_reg()
+                self.body_lines.append(f"  {reg} = xor i1 {operand}, 1")
+                return reg, "bool"
+            if isinstance(node.op, ast.USub):
+                if ty == "int":
+                    reg = self._new_reg()
+                    self.body_lines.append(f"  {reg} = sub i64 0, {operand}")
+                    return reg, "int"
+                if ty == "float":
+                    reg = self._new_reg()
+                    self.body_lines.append(f"  {reg} = fneg double {operand}")
+                    return reg, "float"
+            raise CompileError(
+                f"unsupported unary operator {node.op.__class__.__name__}",
+                code=_ERR_UNSUPPORTED_EXPRESSION,
+                line=getattr(node, "lineno", None),
+                col=getattr(node, "col_offset", None),
+            )
+
         if isinstance(node, ast.BinOp):
             left, left_t = self._compile_expr(node.left)
             right, right_t = self._compile_expr(node.right)
@@ -325,9 +368,10 @@ class _FunctionCompiler:
             right, right_t = self._compile_expr(node.comparators[0])
             op = node.ops[0]
 
-            if left_t == "bool" and right_t == "bool" and isinstance(op, ast.Eq):
+            if left_t == "bool" and right_t == "bool" and isinstance(op, (ast.Eq, ast.NotEq)):
+                pred = "eq" if isinstance(op, ast.Eq) else "ne"
                 reg = self._new_reg()
-                self.body_lines.append(f"  {reg} = icmp eq i1 {left}, {right}")
+                self.body_lines.append(f"  {reg} = icmp {pred} i1 {left}, {right}")
                 return reg, "bool"
 
             if is_numeric_type(left_t) and is_numeric_type(right_t):
@@ -475,7 +519,7 @@ class _FunctionCompiler:
         op: ast.cmpop,
     ) -> str:
         if left_t == "int" and right_t == "int":
-            pred_map = {ast.Lt: "slt", ast.LtE: "sle", ast.Gt: "sgt", ast.GtE: "sge", ast.Eq: "eq"}
+            pred_map = {ast.Lt: "slt", ast.LtE: "sle", ast.Gt: "sgt", ast.GtE: "sge", ast.Eq: "eq", ast.NotEq: "ne"}
             pred = pred_map.get(type(op))
             if pred is None:
                 raise CompileError("comparison operator not supported", code=_ERR_UNSUPPORTED_EXPRESSION, line=node.lineno, col=node.col_offset)
@@ -484,7 +528,7 @@ class _FunctionCompiler:
             return reg
 
         if not is_union_type(left_t) and not is_union_type(right_t):
-            pred_map = {ast.Lt: "olt", ast.LtE: "ole", ast.Gt: "ogt", ast.GtE: "oge", ast.Eq: "oeq"}
+            pred_map = {ast.Lt: "olt", ast.LtE: "ole", ast.Gt: "ogt", ast.GtE: "oge", ast.Eq: "oeq", ast.NotEq: "one"}
             pred = pred_map.get(type(op))
             if pred is None:
                 raise CompileError("comparison operator not supported", code=_ERR_UNSUPPORTED_EXPRESSION, line=node.lineno, col=node.col_offset)
@@ -511,8 +555,8 @@ class _FunctionCompiler:
         merge_label = self._new_label("cmp_merge")
         self.body_lines.append(f"  br i1 {both_int}, label %{int_label}, label %{float_label}")
 
-        int_pred_map = {ast.Lt: "slt", ast.LtE: "sle", ast.Gt: "sgt", ast.GtE: "sge", ast.Eq: "eq"}
-        float_pred_map = {ast.Lt: "olt", ast.LtE: "ole", ast.Gt: "ogt", ast.GtE: "oge", ast.Eq: "oeq"}
+        int_pred_map = {ast.Lt: "slt", ast.LtE: "sle", ast.Gt: "sgt", ast.GtE: "sge", ast.Eq: "eq", ast.NotEq: "ne"}
+        float_pred_map = {ast.Lt: "olt", ast.LtE: "ole", ast.Gt: "ogt", ast.GtE: "oge", ast.Eq: "oeq", ast.NotEq: "one"}
         int_pred = int_pred_map.get(type(op))
         float_pred = float_pred_map.get(type(op))
         if int_pred is None or float_pred is None:

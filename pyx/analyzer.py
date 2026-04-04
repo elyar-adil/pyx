@@ -182,6 +182,12 @@ class Analyzer(ast.NodeVisitor):
             key_t = self._infer_expr_type(node.keys[0])
             val_t = self._infer_expr_type(node.values[0])
             return f"dict[{key_t},{val_t}]"
+        if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.Not):
+                return "bool"
+            if isinstance(node.op, ast.USub):
+                return self._infer_expr_type(node.operand)
+            return "Any"
         if isinstance(node, ast.BinOp):
             left = self._infer_expr_type(node.left)
             right = self._infer_expr_type(node.right)
