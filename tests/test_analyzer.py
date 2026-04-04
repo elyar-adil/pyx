@@ -9,6 +9,13 @@ def write_tmp(tmp_path: Path, code: str) -> Path:
     return p
 
 
+def write_project(tmp_path: Path, files: dict[str, str]) -> Path:
+    for name, code in files.items():
+        path = tmp_path / name
+        path.write_text(code, encoding="utf-8")
+    return tmp_path / "main.py"
+
+
 def test_ok_function(tmp_path: Path) -> None:
     src = write_tmp(
         tmp_path,
@@ -106,3 +113,47 @@ def main(flag: bool) -> int | float:
     )
     errors = Analyzer().analyze_path(src)
     assert any(e.code == "PYX1011" for e in errors)
+
+
+def test_imported_class_and_list_ops_supported(tmp_path: Path) -> None:
+    src = write_project(
+        tmp_path,
+        {
+            "models.py": """
+class Point:
+    x: int
+    y: int
+
+    def total(self) -> int:
+        return self.x + self.y
+""",
+            "main.py": """
+import models
+
+def run(n: int) -> int:
+    p = models.Point(n, 2)
+    xs = [p.total(), n]
+    xs.append(5)
+    return len(xs)
+""",
+        },
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+def test_unknown_field_assignment_rejected(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+class Point:
+    x: int
+
+def run(n: int) -> int:
+    p = Point(n)
+    p.y = 2
+    return p.x
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert any(e.code == "PYX1013" for e in errors)
