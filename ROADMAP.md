@@ -77,34 +77,39 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 让 PyX 能声明并调用任意 C ABI 函数，是生态包（平台绑定、系统库封装等）的基础。
 
 ### 设计原则
-直接复用标准库 `ctypes` 的 API，**不引入任何新模块或新语法**。
-`python foo.py` 时 ctypes 正常运行；`pyx build foo.py` 时编译器静态识别 `CFUNCTYPE` 声明模式，生成原生 LLVM extern 调用，零 ctypes 运行时开销。
+直接复用标准库 `ctypes` 的 API，**不引入任何新模块或新语法**，采用**动态链接**方式。
 
-使用 `CFUNCTYPE` 而非 `argtypes`/`restype` 赋值，原因是后者是运行时属性变更（monkey-patch），签名可在任意位置被修改，编译器无法静态确定；`CFUNCTYPE` 是纯表达式，签名在绑定点一次性固定。
+`python foo.py` 时 ctypes 正常运行；`pyx build foo.py` 时各语句独立编译：
+- `CDLL("c")` → 编译为 `dlopen` 调用，库在运行时加载，编译器无需跨语句解析库归属
+- `CFUNCTYPE(...)` → 纯类型信息，不生成运行时代码，结果作为函数指针类型记入 analyzer
+- `_puts_t(("puts", _libc))` → 编译为 `dlsym` 调用 + 函数指针类型转换，类型从 `_puts_t` 普通推断即可
+- `puts(b"hello")` → 通过函数指针间接调用，签名从 `puts` 的已知类型提取
+
+使用 `CFUNCTYPE` 而非 `argtypes`/`restype` 赋值，原因是后者是 monkey-patch，签名可在任意位置被修改，编译器无法静态确定调用时的签名。
 
 ```python
 import ctypes
 
-_libc  = ctypes.CDLL("c")                                  # 编译时：链接 -lc
-_puts_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p)  # 编译时：提取签名
-puts   = _puts_t(("puts", _libc))                          # 编译时：生成 extern 声明
+_libc   = ctypes.CDLL("c")                                   # → dlopen("libc.so.6")
+_puts_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p)    # → 类型: fn(c_char_p)->c_int
+puts    = _puts_t(("puts", _libc))                           # → dlsym(_libc, "puts") + 类型转换
 
-puts(b"hello")                                              # 编译时：原生 call 指令
+puts(b"hello")                                                # → 函数指针间接调用
 ```
 
 ### 计划项
-1. **编译器模式识别**
-   - analyzer 识别 `ctypes.CDLL("name")` → 记录链接依赖 `-lname`
-   - analyzer 识别 `ctypes.CFUNCTYPE(restype, *argtypes)` → 提取函数签名
-   - analyzer 识别 `fn_t(("symbol", lib))` 绑定模式 → 关联符号与签名
-   - compiler 将绑定的函数调用编译为 LLVM IR extern 声明 + call 指令
-2. **支持的 ctypes 类型**
-   - 整数：`c_int`、`c_long`、`c_longlong`、`c_size_t` 等
-   - 浮点：`c_float`、`c_double`
-   - 指针：`c_void_p`、`c_char_p`、`POINTER(T)`
-3. **构建集成**
-   - `pyx build` 根据识别到的 `CDLL` 自动向链接器传递 `-l` 参数
-   - `build_report.json` 记录外部库依赖
+1. **analyzer 扩展**
+   - `ctypes.CFUNCTYPE(restype, *argtypes)` → 记录为函数指针类型，供后续推断使用
+   - `CDLL(name)` → 类型标记为"动态库句柄"
+   - `fn_t(("symbol", lib))` → 类型从 `fn_t` 推断，生成 `dlopen`/`dlsym` 调用
+2. **compiler 扩展**
+   - `CDLL` → `dlopen` LLVM IR 调用
+   - `fn_t(("sym", lib))` → `dlsym` + `bitcast` 到对应函数指针类型
+   - 函数指针调用 → LLVM `call` 通过指针（间接调用）
+3. **支持的 ctypes 类型映射**
+   - 整数：`c_int` → `i32`，`c_long` → `i64`，`c_size_t` → `i64` 等
+   - 浮点：`c_float` → `float`，`c_double` → `double`
+   - 指针：`c_void_p` / `c_char_p` → `ptr`，`POINTER(T)` → `ptr`
 
 ### 完成标准
 - 同一份 `.py` 文件既能被 `python` 直接运行，也能被 `pyx build` 编译为原生可执行文件。

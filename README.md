@@ -41,11 +41,11 @@ PyX 在 Phase 4 支持以标准 `ctypes` 写法调用原生系统库，编译时
 ```python
 import ctypes
 
-libc = ctypes.CDLL("c")
-libc.puts.argtypes = [ctypes.c_char_p]
-libc.puts.restype  = ctypes.c_int
+_libc   = ctypes.CDLL("c")                                  # → dlopen at runtime
+_puts_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p)   # → 函数指针类型
+puts    = _puts_t(("puts", _libc))                          # → dlsym + 类型转换
 
-libc.puts(b"hello")   # python foo.py 和 pyx build foo.py 均可运行
+puts(b"hello")   # python foo.py 和 pyx build foo.py 均可运行
 ```
 
 ## 生态系统
