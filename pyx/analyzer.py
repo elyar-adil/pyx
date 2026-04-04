@@ -172,6 +172,9 @@ class Analyzer:
             return
 
         if isinstance(stmt, ast.Expr):
+            if not isinstance(stmt.value, ast.Call):
+                self._error(stmt, _ERR_UNSUPPORTED, "Only function calls are supported as expression statements")
+                return
             self._infer_expr_type(stmt.value, ctx)
             return
 
@@ -334,6 +337,13 @@ class Analyzer:
                 value_t = self._merge_collection_item_type(value_t, self._infer_expr_type(value_node, ctx))
             return f"dict[{key_t},{value_t}]"
 
+        if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.Not):
+                return "bool"
+            if isinstance(node.op, ast.USub):
+                return self._infer_expr_type(node.operand, ctx)
+            return "Any"
+
         if isinstance(node, ast.Attribute):
             if isinstance(node.value, ast.Name):
                 imported_module = ctx.module.imported_modules.get(node.value.id)
@@ -379,6 +389,7 @@ class Analyzer:
                 return "str"
             self._error(node, _ERR_UNSUPPORTED, f"Subscript is not supported for '{container_t}'")
             return "Any"
+
 
         if isinstance(node, ast.BinOp):
             left = self._infer_expr_type(node.left, ctx)

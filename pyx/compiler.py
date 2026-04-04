@@ -88,7 +88,7 @@ def llvm_type(py_type: str) -> str:
         return LIST_LLVM_TYPE
     if "." in normalized and "[" not in normalized:
         return _class_type_name(normalized)
-    raise KeyError(py_type)
+    raise CompileError(f"type '{py_type}' cannot be lowered to LLVM IR", code=_ERR_UNSUPPORTED_TYPE)
 
 
 @dataclass
@@ -239,6 +239,26 @@ class _FunctionCompiler:
                     self.body_lines.append(f"  store {llvm_type(annotated)} {coerced}, ptr %{stmt.target.id}.slot")
                 continue
 
+            if isinstance(stmt, ast.AnnAssign):
+                if not isinstance(stmt.target, ast.Name):
+                    raise CompileError(
+                        "only simple name annotation is supported",
+                        code=_ERR_UNSUPPORTED_STATEMENT,
+                        line=stmt.lineno,
+                        col=stmt.col_offset,
+                    )
+                name = stmt.target.id
+                ann_ty = self._annotation_to_type(stmt.annotation, stmt, f"annotated variable '{name}'")
+                if stmt.value is not None:
+                    value, value_ty = self._compile_expr(stmt.value)
+                    if name not in self.slot_types:
+                        self._ensure_slot(name, ann_ty)
+                    coerced, _ = self._coerce_value(value, value_ty, self.slot_types[name], stmt, f"annotated assignment type mismatch for '{name}'")
+                    self.body_lines.append(f"  store {llvm_type(self.slot_types[name])} {coerced}, ptr %{name}.slot")
+                else:
+                    self._ensure_slot(name, ann_ty)
+                continue
+
             if isinstance(stmt, ast.If):
                 cond, cond_t = self._compile_expr(stmt.test)
                 self._require_assignable(cond_t, "bool", stmt, "if condition must be bool")
@@ -376,6 +396,29 @@ class _FunctionCompiler:
             self.body_lines.append(f"  {reg} = load {llvm_type(ty)}, ptr %{node.id}.slot")
             return reg, ty
 
+        if isinstance(node, ast.UnaryOp):
+            operand, ty = self._compile_expr(node.operand)
+            if isinstance(node.op, ast.Not):
+                self._require_assignable(ty, "bool", node, "unary 'not' requires bool operand")
+                reg = self._new_reg()
+                self.body_lines.append(f"  {reg} = xor i1 {operand}, 1")
+                return reg, "bool"
+            if isinstance(node.op, ast.USub):
+                if ty == "int":
+                    reg = self._new_reg()
+                    self.body_lines.append(f"  {reg} = sub i64 0, {operand}")
+                    return reg, "int"
+                if ty == "float":
+                    reg = self._new_reg()
+                    self.body_lines.append(f"  {reg} = fneg double {operand}")
+                    return reg, "float"
+            raise CompileError(
+                f"unsupported unary operator {node.op.__class__.__name__}",
+                code=_ERR_UNSUPPORTED_EXPRESSION,
+                line=getattr(node, "lineno", None),
+                col=getattr(node, "col_offset", None),
+            )
+
         if isinstance(node, ast.List):
             return self._compile_list_literal(node)
 
@@ -412,9 +455,11 @@ class _FunctionCompiler:
             left, left_t = self._compile_expr(node.left)
             right, right_t = self._compile_expr(node.comparators[0])
             op = node.ops[0]
-            if left_t == "bool" and right_t == "bool" and isinstance(op, ast.Eq):
+
+            if left_t == "bool" and right_t == "bool" and isinstance(op, (ast.Eq, ast.NotEq)):
+                pred = "eq" if isinstance(op, ast.Eq) else "ne"
                 reg = self._new_reg()
-                self.body_lines.append(f"  {reg} = icmp eq i1 {left}, {right}")
+                self.body_lines.append(f"  {reg} = icmp {pred} i1 {left}, {right}")
                 return reg, "bool"
             if is_numeric_type(left_t) and is_numeric_type(right_t):
                 return self._compile_numeric_compare(left, left_t, right, right_t, node, op), "bool"
@@ -446,6 +491,14 @@ class _FunctionCompiler:
 
         if isinstance(node.func, ast.Name) and node.func.id in self.module.classes:
             return self._compile_constructor(self.module.classes[node.func.id][1], node.args, node)
+
+        if isinstance(node.func, ast.Name):
+            imported = self.module.imported_symbols.get(node.func.id)
+            if imported is not None:
+                target_module = self.project.lookup_module(imported.module_name)
+                assert target_module is not None
+                if imported.symbol_name in target_module.classes:
+                    return self._compile_constructor(target_module.classes[imported.symbol_name][1], node.args, node)
 
         if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id in self.module.imported_modules:
             imported_module = self.module.imported_modules[node.func.value.id]
@@ -499,31 +552,48 @@ class _FunctionCompiler:
 
     def _compile_subscript(self, node: ast.Subscript) -> tuple[str, str]:
         container, container_t = self._compile_expr(node.value)
-        item_t = parse_list_type(container_t)
-        if item_t is None:
-            raise CompileError(f"subscript is only supported for list[T] in LLVM mode, got {container_t}", code=_ERR_UNSUPPORTED_EXPRESSION, line=node.lineno, col=node.col_offset)
         index, index_t = self._compile_expr(node.slice)
-        self._require_assignable(index_t, "int", node, "list index must be int")
-        data_ptr, _, _ = self._extract_list_parts(container)
-        elem_ptr = self._new_reg()
-        elem_val = self._new_reg()
-        self.body_lines.append(f"  {elem_ptr} = getelementptr {llvm_type(item_t)}, ptr {data_ptr}, i64 {index}")
-        self.body_lines.append(f"  {elem_val} = load {llvm_type(item_t)}, ptr {elem_ptr}")
-        return elem_val, item_t
+        self._require_assignable(index_t, "int", node, "index must be int")
+
+        item_t = parse_list_type(container_t)
+        if item_t is not None:
+            data_ptr, _, _ = self._extract_list_parts(container)
+            elem_ptr = self._new_reg()
+            elem_val = self._new_reg()
+            self.body_lines.append(f"  {elem_ptr} = getelementptr {llvm_type(item_t)}, ptr {data_ptr}, i64 {index}")
+            self.body_lines.append(f"  {elem_val} = load {llvm_type(item_t)}, ptr {elem_ptr}")
+            return elem_val, item_t
+
+        if container_t == "str":
+            # Returns a 1-char view into the original string buffer.
+            data_ptr, _ = self._extract_str_parts(container)
+            char_ptr = self._new_reg()
+            self.body_lines.append(f"  {char_ptr} = getelementptr i8, ptr {data_ptr}, i64 {index}")
+            return self._build_str_value(char_ptr, "1"), "str"
+
+        raise CompileError(
+            f"subscript is not supported for '{container_t}' in LLVM mode",
+            code=_ERR_UNSUPPORTED_EXPRESSION,
+            line=node.lineno,
+            col=node.col_offset,
+        )
 
     def _compile_list_literal(self, node: ast.List) -> tuple[str, str]:
         if not node.elts:
             return self._build_list_value("null", "0", "0"), "list[Any]"
-        item_t = self._infer_list_item_type(node)
+        # Single pass: compile all elements first, then determine item type.
+        compiled: list[tuple[str, str]] = [self._compile_expr(elt) for elt in node.elts]
+        item_t = compiled[0][1]
+        for _, t in compiled[1:]:
+            item_t = self._merge_item_type(item_t, t)
         if item_t not in {"int", "float", "bool", "str"}:
             raise CompileError(f"list element type '{item_t}' is not supported in LLVM mode", code=_ERR_UNSUPPORTED_TYPE, line=node.lineno, col=node.col_offset)
         self.ctx.uses_malloc = True
         count = len(node.elts)
         alloc_reg = self._new_reg()
         self.body_lines.append(f"  {alloc_reg} = call ptr @malloc(i64 {count * self._element_size(item_t)})")
-        for index, elt in enumerate(node.elts):
-            value, got_t = self._compile_expr(elt)
-            coerced, _ = self._coerce_value(value, got_t, item_t, elt, "list literal element type mismatch")
+        for index, (value, got_t) in enumerate(compiled):
+            coerced, _ = self._coerce_value(value, got_t, item_t, node.elts[index], "list literal element type mismatch")
             elem_ptr = self._new_reg()
             self.body_lines.append(f"  {elem_ptr} = getelementptr {llvm_type(item_t)}, ptr {alloc_reg}, i64 {index}")
             self.body_lines.append(f"  store {llvm_type(item_t)} {coerced}, ptr {elem_ptr}")
@@ -679,7 +749,7 @@ class _FunctionCompiler:
 
     def _compile_numeric_compare(self, left: str, left_t: str, right: str, right_t: str, node: ast.AST, op: ast.cmpop) -> str:
         if left_t == "int" and right_t == "int":
-            pred_map = {ast.Lt: "slt", ast.LtE: "sle", ast.Gt: "sgt", ast.GtE: "sge", ast.Eq: "eq"}
+            pred_map = {ast.Lt: "slt", ast.LtE: "sle", ast.Gt: "sgt", ast.GtE: "sge", ast.Eq: "eq", ast.NotEq: "ne"}
             pred = pred_map.get(type(op))
             if pred is None:
                 raise CompileError("comparison operator not supported", code=_ERR_UNSUPPORTED_EXPRESSION, line=node.lineno, col=node.col_offset)
@@ -688,7 +758,7 @@ class _FunctionCompiler:
             return reg
 
         if not is_union_type(left_t) and not is_union_type(right_t):
-            pred_map = {ast.Lt: "olt", ast.LtE: "ole", ast.Gt: "ogt", ast.GtE: "oge", ast.Eq: "oeq"}
+            pred_map = {ast.Lt: "olt", ast.LtE: "ole", ast.Gt: "ogt", ast.GtE: "oge", ast.Eq: "oeq", ast.NotEq: "one"}
             pred = pred_map.get(type(op))
             if pred is None:
                 raise CompileError("comparison operator not supported", code=_ERR_UNSUPPORTED_EXPRESSION, line=node.lineno, col=node.col_offset)
@@ -713,8 +783,8 @@ class _FunctionCompiler:
         merge_label = self._new_label("cmp_merge")
         self.body_lines.append(f"  br i1 {both_int}, label %{int_label}, label %{float_label}")
 
-        int_pred_map = {ast.Lt: "slt", ast.LtE: "sle", ast.Gt: "sgt", ast.GtE: "sge", ast.Eq: "eq"}
-        float_pred_map = {ast.Lt: "olt", ast.LtE: "ole", ast.Gt: "ogt", ast.GtE: "oge", ast.Eq: "oeq"}
+        int_pred_map = {ast.Lt: "slt", ast.LtE: "sle", ast.Gt: "sgt", ast.GtE: "sge", ast.Eq: "eq", ast.NotEq: "ne"}
+        float_pred_map = {ast.Lt: "olt", ast.LtE: "ole", ast.Gt: "ogt", ast.GtE: "oge", ast.Eq: "oeq", ast.NotEq: "one"}
         int_pred = int_pred_map.get(type(op))
         float_pred = float_pred_map.get(type(op))
         if int_pred is None or float_pred is None:
@@ -867,13 +937,6 @@ class _FunctionCompiler:
             return class_info.field_names.index(field_name)
         except ValueError as exc:
             raise CompileError(f"class '{class_info.name}' has no field '{field_name}'", code=_ERR_UNKNOWN_FIELD, line=node.lineno, col=node.col_offset) from exc
-
-    def _infer_list_item_type(self, node: ast.List) -> str:
-        _, item_t = self._compile_expr(node.elts[0])
-        for elt in node.elts[1:]:
-            _, other_t = self._compile_expr(elt)
-            item_t = self._merge_item_type(item_t, other_t)
-        return item_t
 
     def _merge_item_type(self, left: str, right: str) -> str:
         if left == right:

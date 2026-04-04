@@ -142,6 +142,19 @@ def run(n: int) -> int:
     assert errors == []
 
 
+def test_non_call_expression_statement_rejected(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def f(x: int) -> int:
+    x + 1
+    return x
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert any(e.code == "PYX1014" for e in errors)
+
+
 def test_unknown_field_assignment_rejected(tmp_path: Path) -> None:
     src = write_tmp(
         tmp_path,

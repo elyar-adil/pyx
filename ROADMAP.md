@@ -7,71 +7,76 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 
 ---
 
-## 当前状态（Phase 1 完成，Phase 2 功能完成，验收收尾中）
+## 当前状态（Phase 2 已完成，Phase 3 基础已落地，巩固中）
 
-- ✅ 静态子集检查器（注解约束、变量类型稳定性、反射调用限制）
-- ✅ LLVM IR 代码生成（`int` 函数、算术、函数调用、递归、基础 `if`）
+- ✅ 静态子集检查器（注解约束、类型稳定性、反射限制、模块感知）
+- ✅ LLVM IR 代码生成：`int`/`float`/`bool`/`str`/`list[T]`/`class` struct
+- ✅ 多模块项目：`import` + `from … import`，跨文件符号解析与链接
 - ✅ `pyx build` 构建产物：`.ll` + 可选 `.o`
+- ✅ 36 个自动化测试全部通过
 
 ---
 
-## Phase 2：类型系统与语义补全（功能完成，验收收尾中，目标：2026 Q2）
+## Phase 2：类型系统与语义补全（✅ 已完成，2026 Q2）
 
-### 目标
-扩展可编译语法覆盖，减少"能检查不能编译"的差距。
-
-### 计划项
-1. **控制流增强**
-   - `if/elif/else` 的分支合流（phi 节点）
-2. **变量模型增强**
-   - 支持同类型重赋值（SSA + alloca/store 降级策略）
-3. **类型能力增强**
-   - `bool`、`float` 一等支持
-   - `int | float` 的最小 union 方案（tagged lowering）
-4. **错误体验**
-   - 统一 analyzer / compiler 的报错格式与错误码
-
-### 已落地（2026-04-04）
-- ✅ `while` 基础支持
-- ✅ 同类型重赋值（基于 `alloca/load/store`）
+### 已落地
+- ✅ `if/elif/else` 分支合流（phi 节点）
+- ✅ `while` 循环
+- ✅ 同类型重赋值（`alloca/load/store`）
 - ✅ `bool` / `float` 一等编译支持
-- ✅ `if/elif/else` 分支合流补全
-- ✅ `int | float` 最小 union 方案（tagged lowering）
-- ✅ analyzer / compiler 统一错误格式与错误码
-- ✅ 新增 `elif`、union 数值运算、CLI 诊断格式等自动化测试
+- ✅ `int | float` union（tagged lowering）
+- ✅ 统一 analyzer / compiler 错误格式与错误码（PYX1xxx / PYX2xxx）
+- ✅ `!=` 比较运算符（int、float、bool、union 全路径）
+- ✅ 一元运算符：`not`（xor i1 1）、`-`（sub 0 / fneg）
+- ✅ `x: T = expr` 带注解赋值（AnnAssign）与 analyzer 完全对齐
 
-### 完成标准
-- 至少 20 个端到端用例通过（check + build）。
+### 已知不在 Phase 2 范围
+- 除法 (`/`, `//`, `%`)、`break`/`continue` —— Phase 3 补齐
 
 ---
 
-## Phase 3：数据结构与模块系统（目标：2026 Q3）
+## Phase 3：数据结构与模块系统（🚧 进行中，目标：2026 Q3）
 
 ### 目标
 进入"可用于小型真实项目"的阶段。
 
-### 计划项
-1. **基础类型扩展**
-   - `str` 的原生布局（ptr + len）与基础操作（索引、切片、拼接、UTF-8 编解码）
-   - `bytes` 类型
-2. **容器类型**
-   - `list[T]`：原生布局、`len` / `append` / 索引
-   - `dict[K, V]`：哈希表实现
-3. **`class` / `dataclass` 支持**
-   - 受限 `class` 到 struct 的 lowering
-   - 方法调用的静态分派
-4. **内存管理：ARC + 后台循环收集器**
-   - 默认自动引用计数（ARC）：对象离开作用域时编译器插入 inc/dec，用户无感知
-   - 后台轻量循环收集器：处理 ARC 无法释放的环形引用（如 DOM 的 `parent` 指针）
-   - 逃逸分析（Phase 6 优化）：不逃逸的短生命周期对象直接栈分配，零 malloc
-   - 静态分析只用于检测**类型图上显而易见的环**并给出提示，不作强制决策
-5. **模块系统**
-   - 同包跨文件符号解析与链接
-   - `import` 子集（无动态 import）
+### 已落地（2026-04-04，36 个测试全通过）
+
+**类型与表达式**
+- ✅ `str` 原生布局（`{ ptr, i64 }`）：字面量、变量、参数、print、`len()`、`+` 拼接（malloc + memcpy）、`s[i]` 索引（返回 1-char str 视图）
+- ✅ `list[T]` 原生布局（`{ ptr, i64, i64 }`）：字面量、`len()`、`append()`（realloc 扩容）、`xs[i]` 索引
+- ✅ `class` / `dataclass` → fixed-layout struct：字段读写（extractvalue / insertvalue）、方法调用静态分派（self 作为第一参数）
+- ✅ `from mod import Cls` 构造函数调用（修复：之前只支持 `import mod; mod.Cls()`）
+
+**模块系统**
+- ✅ `import mod` 和 `from mod import sym`（函数 + 类）
+- ✅ 跨模块 analyzer：符号解析、类型推断、方法签名验证
+- ✅ 跨模块 compiler：函数符号 mangling（`@mod_X__fn`）、类类型 mangling（`%type.X__Cls`）
+
+**正确性修复**
+- ✅ `_compile_list_literal` 消除双重编译（之前每个元素编译两次，产生重复 IR 指令）
+- ✅ `llvm_type()` 对未知类型抛出 `CompileError` 而非裸 `KeyError`
+- ✅ Analyzer `ast.Expr` 语句检查：只允许函数调用，非调用表达式明确报错（PYX1014）
+
+### 尚未实现（Phase 3 剩余工作）
+
+| 特性 | 状态 | 说明 |
+|------|------|------|
+| `str[i:j]` 切片 | ❌ | 需要 malloc + memcpy；索引已实现可作为基础 |
+| `str` 比较 (`==`, `!=`) | ❌ | 需要 memcmp 调用 |
+| `dict[K, V]` 编译 | ❌ | Analyzer 已支持类型推断；Compiler 尚未降级（哈希表实现复杂） |
+| `bytes` 类型编译 | ❌ | Analyzer 已识别；Compiler 用 `_ensure_supported_type` 拦截 |
+| `break` / `continue` | ❌ | 需要维护 break/continue 跳转标签栈 |
+| 除法 `/`, `//`, `%` | ❌ | `sdiv` / `fdiv` / `srem`，整数除零行为需明确 |
+| `set[T]` | ❌ | Analyzer 可推断类型；Compiler 不支持 |
+| ARC 内存管理 | ❌ | 当前 heap 分配（str concat、list）不释放 |
+| 循环引用收集器 | ❌ | 依赖 ARC 先落地 |
+| 逃逸分析 | ❌ | Phase 6 优化项 |
 
 ### 完成标准
-- 支持包含多模块、容器操作、自定义类型的示例项目编译。
-- 包含环形引用的对象能被正确释放（循环收集器端到端测试）。
+- 支持包含多模块、`list[T]`/`class`/`str` 操作的完整示例项目编译并运行。
+- `dict[K, V]` 基础操作（set / get）端到端通过。
+- 所有 analyzer 已支持但 compiler 尚未实现的特性，显示清晰的"planned but not yet lowered"错误，不崩溃。
 
 ---
 
