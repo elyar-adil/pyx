@@ -5,6 +5,19 @@ NUMERIC_SCALARS = frozenset({"int", "float"})
 PRIMITIVE_TYPES = frozenset({"int", "float", "bool", "str", "bytes"})
 
 # ---------------------------------------------------------------------------
+# File I/O types
+# ---------------------------------------------------------------------------
+
+#: Internal PyX type for text-mode file handles (fopen with "r"/"w"/"a").
+TEXT_FILE_TYPE = "TextFile"
+
+#: Internal PyX type for binary-mode file handles (fopen with "rb"/"wb"/"ab").
+BIN_FILE_TYPE = "BinaryFile"
+
+#: Both file handle types, for membership tests.
+FILE_TYPES: frozenset[str] = frozenset({TEXT_FILE_TYPE, BIN_FILE_TYPE})
+
+# ---------------------------------------------------------------------------
 # Phase 4: ctypes / C ABI FFI type support
 # ---------------------------------------------------------------------------
 
@@ -135,6 +148,10 @@ def is_supported_type(type_name: str, known_types: set[str] | frozenset[str] | N
         return True
     # Phase 4: ctypes FFI types
     if normalized == CDLL_TYPE or is_cfuncptr_type(normalized):
+        return True
+
+    # File I/O types
+    if normalized in FILE_TYPES:
         return True
 
     list_item = parse_list_type(normalized)

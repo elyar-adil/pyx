@@ -8,11 +8,14 @@ from pathlib import Path
 
 from .project import ClassInfo, FunctionSignature, ModuleInfo, ProjectInfo, ProjectLoadError, load_project
 from .type_system import (
+    BIN_FILE_TYPE,
     CDLL_TYPE,
     CTYPES_ALL_TYPES,
     CTYPES_FLOAT_TYPES,
     CTYPES_INT_TYPES,
+    FILE_TYPES,
     NUMERIC_UNION,
+    TEXT_FILE_TYPE,
     can_assign_type,
     ctypes_to_pyx_type,
     is_cfuncptr_type,
@@ -31,6 +34,7 @@ TYPE_MAP = {"int": "i64", "float": "double", "bool": "i1"}
 UNION_LLVM_TYPE = "{ i1, double }"
 STR_LLVM_TYPE = "%pyx.str"
 LIST_LLVM_TYPE = "%pyx.list"
+BYTES_LLVM_TYPE = "%pyx.bytes"
 
 # ---------------------------------------------------------------------------
 # Phase 4: ctypes / C ABI FFI
@@ -102,6 +106,22 @@ def _encode_llvm_string(value: str) -> tuple[str, int]:
     return f'c"{"".join(parts)}"', len(value.encode("utf-8")) + 1
 
 
+def _encode_llvm_bytes(value: bytes) -> tuple[str, int]:
+    """Encode a bytes literal as an LLVM byte-array constant (no null terminator)."""
+    parts: list[str] = []
+    for byte in value:
+        if 0x20 <= byte <= 0x7E and byte not in (0x22, 0x5C):
+            parts.append(chr(byte))
+        else:
+            parts.append(f"\\{byte:02x}")
+    nbytes = len(value)
+    if nbytes == 0:
+        # LLVM does not allow zero-length arrays; emit one null byte placeholder.
+        parts.append("\\00")
+        nbytes = 1
+    return f'c"{"".join(parts)}"', nbytes
+
+
 def _mangle_path(name: str) -> str:
     return name.replace(".", "__")
 
@@ -118,10 +138,15 @@ def llvm_type(py_type: str) -> str:
         return TYPE_MAP[normalized]
     if normalized == "str":
         return STR_LLVM_TYPE
+    if normalized == "bytes":
+        return BYTES_LLVM_TYPE
     if parse_list_type(normalized) is not None:
         return LIST_LLVM_TYPE
     # Phase 4: cdll handles and function pointers are opaque pointers at runtime.
     if normalized == CDLL_TYPE or is_cfuncptr_type(normalized):
+        return "ptr"
+    # File I/O: file handles are opaque FILE* pointers.
+    if normalized in FILE_TYPES:
         return "ptr"
     if "." in normalized and "[" not in normalized:
         return _class_type_name(normalized)
@@ -161,8 +186,17 @@ class _ModuleContext:
         self.uses_utf8_helpers = False
         self.uses_dlopen = False   # Phase 4: ctypes.CDLL
         self.uses_dlsym = False    # Phase 4: fn_t(("sym", lib))
+        # File I/O
+        self.uses_fopen = False
+        self.uses_fclose = False
+        self.uses_fwrite = False
+        self.uses_file_read_text = False    # emit @__pyx_file_read_text helper
+        self.uses_file_read_binary = False  # emit @__pyx_file_read_binary helper
+        self.uses_file_readline = False     # emit @__pyx_file_readline helper
         self._str_by_value: dict[str, str] = {}
         self._str_globals: list[tuple[str, str]] = []
+        self._bytes_by_value: dict[bytes, str] = {}
+        self._bytes_globals: list[tuple[str, bytes]] = []
 
     def alloc_string(self, value: str) -> str:
         if value not in self._str_by_value:
@@ -170,6 +204,13 @@ class _ModuleContext:
             self._str_by_value[value] = name
             self._str_globals.append((name, value))
         return self._str_by_value[value]
+
+    def alloc_bytes(self, value: bytes) -> str:
+        if value not in self._bytes_by_value:
+            name = f"@__pyx_bytes_{len(self._bytes_by_value)}"
+            self._bytes_by_value[value] = name
+            self._bytes_globals.append((name, value))
+        return self._bytes_by_value[value]
 
     def function_symbol(self, signature: FunctionSignature) -> str:
         if signature.class_name is not None:
@@ -183,8 +224,15 @@ class _ModuleContext:
     def emit_preamble(self) -> list[str]:
         if self.uses_utf8_helpers:
             self.uses_abort = True
+        # File read helpers require malloc, fseek, ftell, fread, fgets, strlen, memcpy.
+        if self.uses_file_read_text or self.uses_file_read_binary:
+            self.uses_malloc = True
+        if self.uses_file_readline:
+            self.uses_malloc = True
+            self.uses_memcpy = True
         lines = [
             f"{STR_LLVM_TYPE} = type {{ ptr, i64 }}",
+            f"{BYTES_LLVM_TYPE} = type {{ ptr, i64 }}",
             f"{LIST_LLVM_TYPE} = type {{ ptr, i64, i64 }}",
         ]
         for module in self.project.modules.values():
@@ -198,7 +246,10 @@ class _ModuleContext:
         for gname, value in self._str_globals:
             literal, nbytes = _encode_llvm_string(value)
             lines.append(f"{gname} = private unnamed_addr constant [{nbytes} x i8] {literal}")
-        if self._str_globals:
+        for gname, value in self._bytes_globals:
+            literal, nbytes = _encode_llvm_bytes(value)
+            lines.append(f"{gname} = private unnamed_addr constant [{nbytes} x i8] {literal}")
+        if self._str_globals or self._bytes_globals:
             lines.append("")
         if self.uses_printf:
             lines.append("declare i32 @printf(ptr, ...)")
@@ -214,10 +265,36 @@ class _ModuleContext:
             lines.append("declare ptr @dlopen(ptr, i32)")
         if self.uses_dlsym:
             lines.append("declare ptr @dlsym(ptr, ptr)")
-        if self.uses_printf or self.uses_malloc or self.uses_realloc or self.uses_memcpy or self.uses_abort or self.uses_dlopen or self.uses_dlsym:
+        if self.uses_fopen:
+            lines.append("declare ptr @fopen(ptr, ptr)")
+        if self.uses_fclose:
+            lines.append("declare i32 @fclose(ptr)")
+        if self.uses_fwrite:
+            lines.append("declare i64 @fwrite(ptr, i64, i64, ptr)")
+        if self.uses_file_read_text or self.uses_file_read_binary:
+            lines.append("declare i32 @fseek(ptr, i64, i32)")
+            lines.append("declare i64 @ftell(ptr)")
+            lines.append("declare i64 @fread(ptr, i64, i64, ptr)")
+        if self.uses_file_readline:
+            lines.append("declare ptr @fgets(ptr, i32, ptr)")
+            lines.append("declare i64 @strlen(ptr)")
+        has_any_decl = (
+            self.uses_printf or self.uses_malloc or self.uses_realloc
+            or self.uses_memcpy or self.uses_abort or self.uses_dlopen
+            or self.uses_dlsym or self.uses_fopen or self.uses_fclose
+            or self.uses_fwrite or self.uses_file_read_text
+            or self.uses_file_read_binary or self.uses_file_readline
+        )
+        if has_any_decl:
             lines.append("")
         if self.uses_utf8_helpers:
             lines.extend(self._emit_utf8_helpers())
+        if self.uses_file_read_text:
+            lines.extend(self._emit_file_read_text_helper())
+        if self.uses_file_read_binary:
+            lines.extend(self._emit_file_read_binary_helper())
+        if self.uses_file_readline:
+            lines.extend(self._emit_file_readline_helper())
         return lines
 
     def _emit_utf8_helpers(self) -> list[str]:
@@ -289,6 +366,80 @@ class _ModuleContext:
             "trap:",
             "  call void @abort()",
             "  unreachable",
+            "}",
+            "",
+        ]
+
+
+    def _emit_file_read_text_helper(self) -> list[str]:
+        """Emit @__pyx_file_read_text(ptr %fp) -> %pyx.str.
+
+        Reads the entire file using fseek/ftell/fread and returns a str value.
+        The buffer is heap-allocated and null-terminated.
+        """
+        return [
+            f"define private {STR_LLVM_TYPE} @__pyx_file_read_text(ptr %fp) {{",
+            "entry:",
+            "  call i32 @fseek(ptr %fp, i64 0, i32 2)",
+            "  %size = call i64 @ftell(ptr %fp)",
+            "  call i32 @fseek(ptr %fp, i64 0, i32 0)",
+            "  %alloc_size = add i64 %size, 1",
+            "  %buf = call ptr @malloc(i64 %alloc_size)",
+            "  call i64 @fread(ptr %buf, i64 1, i64 %size, ptr %fp)",
+            "  %end = getelementptr i8, ptr %buf, i64 %size",
+            "  store i8 0, ptr %end",
+            f"  %s0 = insertvalue {STR_LLVM_TYPE} undef, ptr %buf, 0",
+            f"  %s1 = insertvalue {STR_LLVM_TYPE} %s0, i64 %size, 1",
+            f"  ret {STR_LLVM_TYPE} %s1",
+            "}",
+            "",
+        ]
+
+    def _emit_file_read_binary_helper(self) -> list[str]:
+        """Emit @__pyx_file_read_binary(ptr %fp) -> %pyx.bytes.
+
+        Reads the entire file and returns a bytes value.
+        """
+        return [
+            f"define private {BYTES_LLVM_TYPE} @__pyx_file_read_binary(ptr %fp) {{",
+            "entry:",
+            "  call i32 @fseek(ptr %fp, i64 0, i32 2)",
+            "  %size = call i64 @ftell(ptr %fp)",
+            "  call i32 @fseek(ptr %fp, i64 0, i32 0)",
+            "  %buf = call ptr @malloc(i64 %size)",
+            "  call i64 @fread(ptr %buf, i64 1, i64 %size, ptr %fp)",
+            f"  %b0 = insertvalue {BYTES_LLVM_TYPE} undef, ptr %buf, 0",
+            f"  %b1 = insertvalue {BYTES_LLVM_TYPE} %b0, i64 %size, 1",
+            f"  ret {BYTES_LLVM_TYPE} %b1",
+            "}",
+            "",
+        ]
+
+    def _emit_file_readline_helper(self) -> list[str]:
+        """Emit @__pyx_file_readline(ptr %fp) -> %pyx.str.
+
+        Reads one line (up to 4096 bytes) via fgets and returns a str value.
+        Returns an empty str on EOF.
+        """
+        return [
+            f"define private {STR_LLVM_TYPE} @__pyx_file_readline(ptr %fp) {{",
+            "entry:",
+            "  %buf = call ptr @malloc(i64 4096)",
+            "  %result = call ptr @fgets(ptr %buf, i32 4096, ptr %fp)",
+            "  %is_eof = icmp eq ptr %result, null",
+            "  br i1 %is_eof, label %eof, label %got_line",
+            "eof:",
+            f"  %se0 = insertvalue {STR_LLVM_TYPE} undef, ptr %buf, 0",
+            f"  %se1 = insertvalue {STR_LLVM_TYPE} %se0, i64 0, 1",
+            f"  ret {STR_LLVM_TYPE} %se1",
+            "got_line:",
+            "  %len = call i64 @strlen(ptr %buf)",
+            "  %copy_size = add i64 %len, 1",
+            "  %heap = call ptr @malloc(i64 %copy_size)",
+            "  call ptr @memcpy(ptr %heap, ptr %buf, i64 %copy_size)",
+            f"  %sl0 = insertvalue {STR_LLVM_TYPE} undef, ptr %heap, 0",
+            f"  %sl1 = insertvalue {STR_LLVM_TYPE} %sl0, i64 %len, 1",
+            f"  ret {STR_LLVM_TYPE} %sl1",
             "}",
             "",
         ]
@@ -425,6 +576,12 @@ class _FunctionCompiler:
                 self.body_lines.append(f"{end_label}:")
                 continue
 
+            if isinstance(stmt, ast.With):
+                body_terminated = self._compile_with_stmt(stmt, expected_ret)
+                if body_terminated:
+                    return True
+                continue
+
             if isinstance(stmt, ast.Expr):
                 if isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Name) and stmt.value.func.id == "print":
                     self._compile_print(stmt.value)
@@ -535,12 +692,8 @@ class _FunctionCompiler:
             if isinstance(node.value, str):
                 return self._compile_string_literal(node.value), "str"
             if isinstance(node.value, bytes):
-                raise CompileError(
-                    "type 'bytes' is planned but not lowered in LLVM mode yet",
-                    code=_ERR_UNSUPPORTED_TYPE,
-                    line=node.lineno,
-                    col=node.col_offset,
-                )
+                gname = self.ctx.alloc_bytes(node.value)
+                return self._build_bytes_value(gname, str(len(node.value))), "bytes"
 
         if isinstance(node, ast.Name):
             if node.id not in self.slot_types:
@@ -661,10 +814,16 @@ class _FunctionCompiler:
                 reg = self._new_reg()
                 self.body_lines.append(f"  {reg} = call i64 @__pyx_utf8_len(ptr {data_ptr}, i64 {byte_length})")
                 return reg, "int"
+            if value_t == "bytes":
+                _, byte_length = self._extract_bytes_parts(value)
+                return byte_length, "int"
             if parse_list_type(value_t) is not None:
                 _, length, _ = self._extract_list_parts(value)
                 return length, "int"
             raise CompileError(f"len() does not support '{value_t}' in LLVM mode", code=_ERR_UNSUPPORTED_EXPRESSION, line=node.lineno, col=node.col_offset)
+
+        if isinstance(node.func, ast.Name) and node.func.id == "open":
+            return self._compile_open(node)
 
         if self._is_list_append_call(node):
             raise CompileError("list.append() is a statement in LLVM mode", code=_ERR_UNSUPPORTED_EXPRESSION, line=node.lineno, col=node.col_offset)
@@ -710,6 +869,11 @@ class _FunctionCompiler:
 
         if isinstance(node.func, ast.Attribute):
             owner_val, owner_t = self._compile_expr(node.func.value)
+
+            # File method dispatch
+            if owner_t in FILE_TYPES:
+                return self._compile_file_method(owner_val, owner_t, node.func.attr, node)
+
             class_info = self.project.lookup_class(owner_t)
             if class_info is not None and node.func.attr in class_info.methods:
                 signature = class_info.methods[node.func.attr]
@@ -858,6 +1022,167 @@ class _FunctionCompiler:
         self.body_lines.append(f"  {new_len} = add i64 {length}, 1")
         new_list = self._build_list_value(data_phi, new_len, cap_phi)
         self.body_lines.append(f"  store {LIST_LLVM_TYPE} {new_list}, ptr %{list_name}.slot")
+
+    # ------------------------------------------------------------------
+    # File I/O helpers
+    # ------------------------------------------------------------------
+
+    def _compile_with_stmt(self, stmt: ast.With, expected_ret: str) -> bool:
+        """Compile ``with open(...) as f:`` — returns True if body terminated."""
+        if len(stmt.items) != 1:
+            raise CompileError(
+                "only single-item with statements are supported",
+                code=_ERR_UNSUPPORTED_STATEMENT,
+                line=stmt.lineno,
+                col=stmt.col_offset,
+            )
+        item = stmt.items[0]
+        if not (isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+                and item.context_expr.func.id == "open"):
+            raise CompileError(
+                "with statement is only supported for open()",
+                code=_ERR_UNSUPPORTED_STATEMENT,
+                line=stmt.lineno,
+                col=stmt.col_offset,
+            )
+        fp_val, file_t = self._compile_expr(item.context_expr)
+        var_name: str | None = None
+        if item.optional_vars is not None and isinstance(item.optional_vars, ast.Name):
+            var_name = item.optional_vars.id
+            self._ensure_slot(var_name, file_t)
+            self.body_lines.append(f"  store ptr {fp_val}, ptr %{var_name}.slot")
+        body_terminated = self._compile_statements(stmt.body, expected_ret)
+        if not body_terminated:
+            # Emit implicit close on normal exit.
+            self.ctx.uses_fclose = True
+            if var_name is not None:
+                fp_reg = self._new_reg()
+                self.body_lines.append(f"  {fp_reg} = load ptr, ptr %{var_name}.slot")
+                self.body_lines.append(f"  call i32 @fclose(ptr {fp_reg})")
+            else:
+                self.body_lines.append(f"  call i32 @fclose(ptr {fp_val})")
+        return body_terminated
+
+    def _compile_open(self, node: ast.Call) -> tuple[str, str]:
+        """Compile ``open(filename, mode)`` → ``call ptr @fopen(...)``."""
+        self.ctx.uses_fopen = True
+        if not node.args:
+            raise CompileError(
+                "open() requires at least a filename argument",
+                code=_ERR_CALL_ARG_COUNT,
+                line=node.lineno,
+                col=node.col_offset,
+            )
+        fname_val, fname_t = self._compile_expr(node.args[0])
+        if fname_t != "str":
+            raise CompileError(
+                f"open() filename must be str, got '{fname_t}'",
+                code=_ERR_TYPE_MISMATCH,
+                line=node.lineno,
+                col=node.col_offset,
+            )
+        fname_ptr, _ = self._extract_str_parts(fname_val)
+        mode = "r"
+        if len(node.args) >= 2:
+            if not isinstance(node.args[1], ast.Constant) or not isinstance(node.args[1].value, str):
+                raise CompileError(
+                    "open() mode must be a string literal",
+                    code=_ERR_UNSUPPORTED_EXPRESSION,
+                    line=node.lineno,
+                    col=node.col_offset,
+                )
+            mode = node.args[1].value
+        mode_gname = self.ctx.alloc_string(mode)
+        reg = self._new_reg()
+        self.body_lines.append(f"  {reg} = call ptr @fopen(ptr {fname_ptr}, ptr {mode_gname})")
+        file_t = BIN_FILE_TYPE if "b" in mode else TEXT_FILE_TYPE
+        return reg, file_t
+
+    def _compile_file_method(
+        self,
+        fp: str,
+        file_t: str,
+        attr: str,
+        node: ast.Call,
+    ) -> tuple[str, str]:
+        """Dispatch a method call on a TextFile or BinaryFile value."""
+        if attr == "close":
+            self.ctx.uses_fclose = True
+            self.body_lines.append(f"  call i32 @fclose(ptr {fp})")
+            return "0", "None"
+
+        if attr == "read":
+            if file_t == TEXT_FILE_TYPE:
+                self.ctx.uses_file_read_text = True
+                reg = self._new_reg()
+                self.body_lines.append(
+                    f"  {reg} = call {STR_LLVM_TYPE} @__pyx_file_read_text(ptr {fp})"
+                )
+                return reg, "str"
+            else:
+                self.ctx.uses_file_read_binary = True
+                reg = self._new_reg()
+                self.body_lines.append(
+                    f"  {reg} = call {BYTES_LLVM_TYPE} @__pyx_file_read_binary(ptr {fp})"
+                )
+                return reg, "bytes"
+
+        if attr == "readline":
+            if file_t != TEXT_FILE_TYPE:
+                raise CompileError(
+                    "readline() is only supported on text-mode files",
+                    code=_ERR_UNSUPPORTED_EXPRESSION,
+                    line=node.lineno,
+                    col=node.col_offset,
+                )
+            self.ctx.uses_file_readline = True
+            reg = self._new_reg()
+            self.body_lines.append(
+                f"  {reg} = call {STR_LLVM_TYPE} @__pyx_file_readline(ptr {fp})"
+            )
+            return reg, "str"
+
+        if attr == "write":
+            if len(node.args) != 1:
+                raise CompileError(
+                    "write() expects exactly one argument",
+                    code=_ERR_CALL_ARG_COUNT,
+                    line=node.lineno,
+                    col=node.col_offset,
+                )
+            self.ctx.uses_fwrite = True
+            arg_val, arg_t = self._compile_expr(node.args[0])
+            if file_t == TEXT_FILE_TYPE:
+                if arg_t != "str":
+                    raise CompileError(
+                        f"TextFile.write() expects str, got '{arg_t}'",
+                        code=_ERR_TYPE_MISMATCH,
+                        line=node.lineno,
+                        col=node.col_offset,
+                    )
+                data_ptr, data_len = self._extract_str_parts(arg_val)
+            else:
+                if arg_t != "bytes":
+                    raise CompileError(
+                        f"BinaryFile.write() expects bytes, got '{arg_t}'",
+                        code=_ERR_TYPE_MISMATCH,
+                        line=node.lineno,
+                        col=node.col_offset,
+                    )
+                data_ptr, data_len = self._extract_bytes_parts(arg_val)
+            reg = self._new_reg()
+            self.body_lines.append(
+                f"  {reg} = call i64 @fwrite(ptr {data_ptr}, i64 1, i64 {data_len}, ptr {fp})"
+            )
+            return reg, "int"
+
+        raise CompileError(
+            f"unknown file method '{attr}'",
+            code=_ERR_UNKNOWN_FUNCTION,
+            line=node.lineno,
+            col=node.col_offset,
+        )
 
     # ------------------------------------------------------------------
     # Phase 4: ctypes / C ABI FFI helpers
@@ -1276,6 +1601,20 @@ class _FunctionCompiler:
         self.body_lines.append(f"  {length} = extractvalue {STR_LLVM_TYPE} {value}, 1")
         return data_ptr, length
 
+    def _build_bytes_value(self, data_ptr: str, length: str) -> str:
+        b0 = self._new_reg()
+        b1 = self._new_reg()
+        self.body_lines.append(f"  {b0} = insertvalue {BYTES_LLVM_TYPE} undef, ptr {data_ptr}, 0")
+        self.body_lines.append(f"  {b1} = insertvalue {BYTES_LLVM_TYPE} {b0}, i64 {length}, 1")
+        return b1
+
+    def _extract_bytes_parts(self, value: str) -> tuple[str, str]:
+        data_ptr = self._new_reg()
+        length = self._new_reg()
+        self.body_lines.append(f"  {data_ptr} = extractvalue {BYTES_LLVM_TYPE} {value}, 0")
+        self.body_lines.append(f"  {length} = extractvalue {BYTES_LLVM_TYPE} {value}, 1")
+        return data_ptr, length
+
     def _build_list_value(self, data_ptr: str, length: str, capacity: str) -> str:
         list0 = self._new_reg()
         list1 = self._new_reg()
@@ -1312,7 +1651,7 @@ class _FunctionCompiler:
     def _ensure_supported_type(self, ty: str, node: ast.AST) -> None:
         if not is_supported_type(ty, self.project.known_type_names()):
             raise CompileError(f"type '{ty}' is not supported", code=_ERR_UNSUPPORTED_TYPE, line=node.lineno, col=node.col_offset)
-        if ty == "bytes" or parse_dict_type(ty) is not None or parse_set_type(ty) is not None:
+        if parse_dict_type(ty) is not None or parse_set_type(ty) is not None:
             raise CompileError(f"type '{ty}' is planned but not lowered in LLVM mode yet", code=_ERR_UNSUPPORTED_TYPE, line=node.lineno, col=node.col_offset)
 
     def _emit_bounds_check(self, index: str, length: str, prefix: str) -> None:
