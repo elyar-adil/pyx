@@ -77,3 +77,32 @@ def f(xs: list[int]) -> int:
     )
     errors = Analyzer().analyze_path(src)
     assert any("unsupported type" in e.message for e in errors)
+
+
+def test_union_numeric_type_supported(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def widen(x: int) -> int | float:
+    y: int | float = x
+    y = 1.5
+    return y + 1
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+def test_call_argument_type_checked(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def accept(x: int | float) -> int | float:
+    return x
+
+def main(flag: bool) -> int | float:
+    return accept(flag)
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert any(e.code == "PYX1011" for e in errors)

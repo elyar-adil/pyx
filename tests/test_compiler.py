@@ -158,3 +158,53 @@ def add(a: int, b: int) -> int:
     ir = LLVMCompiler.from_path(src).compile_ir()
     assert "printf" not in ir
     assert "__pyx_fmt" not in ir
+
+
+def test_compile_if_elif_else_branch_merge(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def classify(n: int) -> int:
+    if n < 0:
+        value = 1
+    elif n == 0:
+        value = 2
+    else:
+        value = 3
+    return value
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "endif" in ir
+    assert "store i64 1, ptr %value.slot" in ir
+    assert "store i64 2, ptr %value.slot" in ir
+    assert "store i64 3, ptr %value.slot" in ir
+    assert "load i64, ptr %value.slot" in ir
+
+
+def test_compile_union_numeric_lowering(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def add_one(x: int | float) -> int | float:
+    return x + 1
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "define { i1, double } @add_one({ i1, double } %x)" in ir
+    assert "extractvalue { i1, double }" in ir
+    assert "insertvalue { i1, double }" in ir
+    assert "phi i1" in ir
+
+
+def test_compile_mixed_numeric_arithmetic_to_float(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def widen(x: int) -> float:
+    return x + 1.5
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "sitofp i64" in ir
+    assert "fadd double" in ir

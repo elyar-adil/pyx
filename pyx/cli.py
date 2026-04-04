@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .analyzer import Analyzer
 from .compiler import CompileError, LLVMCompiler, emit_native_object
+from .diagnostics import Diagnostic, format_diagnostic
 
 
 def cmd_check(source: Path) -> int:
@@ -13,7 +14,7 @@ def cmd_check(source: Path) -> int:
     errors = analyzer.analyze_path(source)
     if errors:
         for err in errors:
-            print(f"{source}:{err.line}:{err.col}: error: {err.message}")
+            print(format_diagnostic(source, Diagnostic(err.code, err.message, err.line, err.col)))
         return 1
     print(f"{source}: OK")
     return 0
@@ -28,7 +29,7 @@ def cmd_build(source: Path, out_dir: Path) -> int:
         compiler = LLVMCompiler.from_path(source)
         llvm_ir = compiler.compile_ir()
     except CompileError as exc:
-        print(f"{source}: llvm error: {exc}")
+        print(format_diagnostic(source, Diagnostic(exc.code, exc.message, exc.line, exc.col)))
         return 1
 
     out_dir.mkdir(parents=True, exist_ok=True)
