@@ -54,6 +54,61 @@ def cmd_build(source: Path, out_dir: Path) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Package manager commands
+# ---------------------------------------------------------------------------
+
+
+def _make_registry(registry_path: Path | None) -> "Registry":  # noqa: F821
+    from .pkg.registry import Registry, get_registry_dir
+
+    return Registry(registry_path if registry_path is not None else get_registry_dir())
+
+
+def cmd_pkg_install(name: str, registry_path: Path | None, project_dir: Path) -> int:
+    """Install *name* (and its dependencies) into ``<project_dir>/pyx_packages/``."""
+    from .pkg.installer import InstallError, install_package
+    from .pkg.installer import PKG_DIR_NAME
+
+    registry = _make_registry(registry_path)
+    install_dir = project_dir / PKG_DIR_NAME
+
+    try:
+        dest = install_package(name, registry, install_dir)
+        print(f"Installed {name} -> {dest}")
+        return 0
+    except InstallError as exc:
+        print(f"error: {exc}")
+        return 1
+
+
+def cmd_pkg_publish(source_dir: Path, registry_path: Path | None) -> int:
+    """Package the project in *source_dir* and publish it to the registry."""
+    from .pkg.installer import publish_package
+    from .pkg.manifest import ManifestError, load_manifest
+
+    manifest_path = source_dir / "pyx.toml"
+    try:
+        manifest = load_manifest(manifest_path)
+    except ManifestError as exc:
+        print(f"error: {exc}")
+        return 1
+
+    registry = _make_registry(registry_path)
+    try:
+        checksum = publish_package(source_dir, manifest, registry)
+        print(f"Published {manifest.name}=={manifest.version}  checksum: {checksum}")
+        return 0
+    except Exception as exc:
+        print(f"error: failed to publish: {exc}")
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="pyx")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -65,10 +120,54 @@ def main() -> int:
     p_build.add_argument("source", type=Path)
     p_build.add_argument("-o", "--out-dir", type=Path, default=Path("dist"))
 
+    p_pkg = sub.add_parser("pkg", help="Package manager")
+    pkg_sub = p_pkg.add_subparsers(dest="pkg_command", required=True)
+
+    p_install = pkg_sub.add_parser("install", help="Install a package")
+    p_install.add_argument("name", help="Package name")
+    p_install.add_argument(
+        "--registry",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Override registry directory (default: $PYX_REGISTRY or ~/.pyx/registry)",
+    )
+    p_install.add_argument(
+        "--project-dir",
+        type=Path,
+        default=Path("."),
+        metavar="DIR",
+        help="Project root directory (default: current directory)",
+    )
+
+    p_publish = pkg_sub.add_parser("publish", help="Publish the current package to the registry")
+    p_publish.add_argument(
+        "--source-dir",
+        type=Path,
+        default=Path("."),
+        metavar="DIR",
+        help="Package source directory containing pyx.toml (default: current directory)",
+    )
+    p_publish.add_argument(
+        "--registry",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Override registry directory (default: $PYX_REGISTRY or ~/.pyx/registry)",
+    )
+
     args = parser.parse_args()
+
     if args.command == "check":
         return cmd_check(args.source)
-    return cmd_build(args.source, args.out_dir)
+    if args.command == "build":
+        return cmd_build(args.source, args.out_dir)
+    if args.command == "pkg":
+        if args.pkg_command == "install":
+            return cmd_pkg_install(args.name, args.registry, args.project_dir)
+        if args.pkg_command == "publish":
+            return cmd_pkg_publish(args.source_dir, args.registry)
+    return 1  # pragma: no cover
 
 
 if __name__ == "__main__":

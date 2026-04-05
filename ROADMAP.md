@@ -1,13 +1,13 @@
 # PyX Roadmap
 
-> Last updated: 2026-04-05（Phase 4 扩展）
+> Last updated: 2026-04-05（Phase 5 包管理器）
 
 PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI 语言特性、包管理器。
 平台绑定（Win32、X11、Wayland 等）、浏览器引擎等属于独立的生态包，不在本仓库职责范围内。
 
 ---
 
-## 当前状态（Phase 2 已完成，Phase 3 核心与基础运行时已落地，Phase 4 扩展能力已落地）
+## 当前状态（Phase 2 已完成，Phase 3 核心与基础运行时已落地，Phase 4 扩展能力已落地，Phase 5 包管理器已落地）
 
 - ✅ 静态子集检查器：注解约束、类型稳定性、反射限制、模块感知
 - ✅ LLVM IR 代码生成：`int` / `float` / `bool` / `str` / `bytes` / `list[T]` / `class` struct
@@ -15,7 +15,8 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 - ✅ 基础文件 I/O：`open()`、`read()`、`write()`、`readline()`、`close()`、`with open(...) as`
 - ✅ `pyx build` 构建产物：`.ll` + 可选 `.o`
 - ✅ Phase 4 扩展 FFI：`POINTER(T)` 组合指针类型、`str`/`bytes` ↔ `c_char_p` 互操作、`c_char_p` 返回 → `bytes`（strlen 路径）、`Any` 不透明指针（`c_void_p`）、`ctypes.string_at(ptr, size)` → `bytes`、cfuncptr 调用参数类型检查
-- ✅ 108 个自动化测试全部通过
+- ✅ Phase 5 包管理器：`pyx.toml` 格式、语义化版本约束、本地注册表、`pyx.lock` 锁文件、`pyx pkg install` / `pyx pkg publish`、`pyx_packages/` 搜索路径
+- ✅ 162 个自动化测试全部通过
 
 ---
 
@@ -138,24 +139,54 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 
 ---
 
-## Phase 5：包管理器（目标：2027 Q1）
+## Phase 5：包管理器（✅ 已完成，2026 Q2）
 
 ### 目标
 提供类似 `pip` 的包管理能力，让平台绑定、GUI 库、网络库等作为独立包分发。
 
-### 计划项
-1. **`pyx pkg` CLI**
-   - `pyx pkg install <name>`：从中央索引下载并安装包
-   - `pyx pkg publish`：打包并发布到索引
-2. **包格式**
-   - `pyx.toml`：包元数据（名称、版本、依赖、动态库声明）
-   - 支持预编译的 `.o` / `.a` 分发（跨平台 FFI 包的常见形式）
-3. **依赖解析**
-   - 语义化版本约束
-   - lock 文件（`pyx.lock`）
+### 已落地（2026-04-05，新增 54 个 Phase 5 测试，总测试数 162）
 
-### 完成标准
-- 能发布一个封装 libc 的最小包，并在另一个项目中通过 `pyx pkg install` 使用它。
+**`pyx pkg` CLI**
+- ✅ `pyx pkg install <name>`：从本地注册表下载并安装包到 `pyx_packages/`
+- ✅ `pyx pkg publish`：打包当前目录并发布到注册表（`--registry` / `PYX_REGISTRY` 环境变量可覆盖路径）
+
+**包格式（`pyx.toml`）**
+- ✅ `[package]` 节：`name`、`version`（严格 semver x.y.z）、`description`
+- ✅ `[dependencies]` 节：`dep-name = "约束字符串"` 格式
+- ✅ `[libraries]` 节：动态库声明（`alias = { path = "libc.so.6" }`）
+- ✅ `save_manifest()` 序列化为合法 TOML
+
+**语义化版本（`pyx.pkg.semver`）**
+- ✅ `Version` 数据类：解析 `x.y.z`，全序比较
+- ✅ 单个约束运算符：`==`、`!=`、`>=`、`>`、`<=`、`<`、`^`（兼容发布）、`~`（近似等价）
+- ✅ 逗号分隔复合约束（AND 语义，如 `>=1.0.0,<2.0.0`）
+- ✅ `best_matching(versions, constraint)` 返回满足约束的最高版本
+
+**本地注册表（`pyx.pkg.registry`）**
+- ✅ 目录结构：`index.json` + `packages/<name>-<version>.tar.gz`
+- ✅ 默认路径 `~/.pyx/registry`，可通过 `PYX_REGISTRY` 环境变量覆盖
+- ✅ `publish(archive, name, version)` 计算 sha256 并写入索引
+- ✅ `list_versions(name)` / `get_checksum(name, version)` / `fetch_archive(name, version)`
+
+**依赖解析与锁文件（`pyx.pkg.resolver`）**
+- ✅ `resolve_dependencies(manifest, registry)` 解析所有直接依赖并选取最高满足版本
+- ✅ `LockFile` / `LockedPackage`：JSON 格式 `pyx.lock`，`load` / `save` / `find`
+
+**安装器（`pyx.pkg.installer`）**
+- ✅ `install_package(name, registry, install_dir, constraint)` 下载并解压到 `pyx_packages/<name>/`，校验 sha256
+- ✅ `publish_package(source_dir, manifest, registry)` 打包为 `.tar.gz`（自动排除 `__pycache__`、`dist`、`.git`、`pyx.lock`）
+- ✅ `install_from_manifest(manifest, registry, project_dir)` 批量安装依赖并写入 `pyx.lock`
+
+**模块解析扩展（`project.py`）**
+- ✅ `_resolve_module_path` 新增 `pyx_packages/` 搜索路径：先找 `pyx_packages/<name>/<name>.py`，再找 `pyx_packages/<name>.py`
+
+### 完成标准验证
+- ✅ 能发布封装 libc 的最小包（`libc-wrap`），并在另一个项目中通过 `install_from_manifest` 安装并通过 `load_project` 正确解析其模块。
+
+### 当前边界
+- 注册表为本地目录（POSIX-first）；远端 HTTP 索引与认证留到后续扩展。
+- 目前只支持直接依赖解析；传递依赖（从已发布包的 `pyx.toml` 中读取）尚未实现（需要在注册表中存储元数据）。
+- 预编译 `.o` / `.a` 分发格式（Phase 5 计划项 2）已通过 tarball 机制支持，但构建系统尚未自动链接安装包中的 `.o` 文件。
 
 ---
 
