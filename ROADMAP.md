@@ -1,21 +1,21 @@
 # PyX Roadmap
 
-> Last updated: 2026-04-05
+> Last updated: 2026-04-05（Phase 4 扩展）
 
 PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI 语言特性、包管理器。
 平台绑定（Win32、X11、Wayland 等）、浏览器引擎等属于独立的生态包，不在本仓库职责范围内。
 
 ---
 
-## 当前状态（Phase 2 已完成，Phase 3 核心与基础运行时已落地，Phase 4 基础能力已落地）
+## 当前状态（Phase 2 已完成，Phase 3 核心与基础运行时已落地，Phase 4 扩展能力已落地）
 
 - ✅ 静态子集检查器：注解约束、类型稳定性、反射限制、模块感知
 - ✅ LLVM IR 代码生成：`int` / `float` / `bool` / `str` / `bytes` / `list[T]` / `class` struct
 - ✅ 多模块项目：`import` + `from ... import`，跨文件符号解析与链接
 - ✅ 基础文件 I/O：`open()`、`read()`、`write()`、`readline()`、`close()`、`with open(...) as`
 - ✅ `pyx build` 构建产物：`.ll` + 可选 `.o`
-- ✅ Phase 4 基础 FFI：`ctypes.CDLL`、`ctypes.CFUNCTYPE`、`dlsym` 绑定、函数指针间接调用
-- ✅ 93 个自动化测试全部通过
+- ✅ Phase 4 扩展 FFI：`POINTER(T)` 组合指针类型、`str`/`bytes` ↔ `c_char_p` 互操作、`c_char_p` 返回 → `bytes`（strlen 路径）、`Any` 不透明指针（`c_void_p`）、`ctypes.string_at(ptr, size)` → `bytes`、cfuncptr 调用参数类型检查
+- ✅ 108 个自动化测试全部通过
 
 ---
 
@@ -93,39 +93,48 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 
 ---
 
-## Phase 4：C ABI FFI（🚧 基础能力已落地，继续扩展）
+## Phase 4：C ABI FFI（🚧 扩展能力已落地，继续完善）
 
 ### 目标
 让 PyX 能以标准 `ctypes` 写法声明并调用 C ABI 函数，为生态包（平台绑定、系统库封装等）提供语言级基础。
 
-### 已落地（2026-04-05）
+### 已落地（2026-04-05 第二轮扩展，共 40 个 Phase 4 测试）
 - ✅ `import ctypes` 与 `from ctypes import ...` 两种导入形式都可被 analyzer / compiler 识别
-- ✅ `ctypes.CDLL("libc.so.6")` 降级为 `dlopen`，内部类型标记为动态库句柄
+- ✅ `ctypes.CDLL(“libc.so.6”)` 降级为 `dlopen`，内部类型标记为动态库句柄
 - ✅ `ctypes.CFUNCTYPE(restype, *argtypes)` 记录为函数指针类型，不生成多余运行时代码
-- ✅ `fn_t(("symbol", lib))` 降级为 `dlsym + bitcast`
+- ✅ `fn_t((“symbol”, lib))` 降级为 `dlsym + bitcast`
 - ✅ 对绑定后的函数指针执行 LLVM 间接调用（`call <ret> (<args>) ...`）
-- ✅ 已覆盖 `c_int`、`c_long`、`c_float`、`c_double`、`c_size_t`、`c_void_p`、`c_char_p`、`c_wchar_p`
-- ✅ 25 个 Phase 4 测试通过（13 analyzer + 12 compiler）
+- ✅ 已覆盖 `c_int`、`c_long`、`c_float`、`c_double`、`c_size_t`、`c_void_p`、`c_char_p`、`c_wchar_p` 等全部基础 ctypes 类型
+- ✅ **`POINTER(T)` 组合指针类型**：analyzer / compiler 均识别 `ctypes.POINTER(T)` 并降级为 `ptr`（等同于 `c_void_p`）；可用于 CFUNCTYPE 签名中
+- ✅ **`str` / `bytes` → `c_char_p` 参数传递**：编译器从 `%pyx.str` / `%pyx.bytes` struct 中 `extractvalue` 出数据指针，analyzer 做类型兼容性检查
+- ✅ **`c_char_p` 返回值 → `bytes`**：通过 `strlen` 获取 C 字符串长度，malloc + memcpy 拷贝到独立堆缓冲区，包装成 `%pyx.bytes`
+- ✅ **`Any` 不透明指针**（`c_void_p` 等返回）：`Any` 类型现在可合法分配槽（LLVM 类型 `ptr`），`is_supported_type(“Any”)` 返回 True
+- ✅ **`ctypes.string_at(ptr, size) → bytes`**：从裸 C 指针按指定长度拷贝数据，返回 `%pyx.bytes`
+- ✅ **cfuncptr 调用参数类型检查**：analyzer 现在在间接调用时检查 PyX 类型与 ctypes 期望类型的兼容性（int / float / str / bytes / Any 分情况）
 
 ### 当前边界
 - `CFUNCTYPE` 路径是**静态可分析**的主路径；`argtypes` / `restype` monkey-patch 方案继续明确不支持。
-- 指针类 `ctypes` 返回值当前按 opaque 值处理，映射回 PyX 侧为 `Any`，还不具备丰富的静态语义。
+- `c_char_p` → `bytes` 路径会做堆拷贝（malloc + memcpy），不保留 C 侧指针所有权；调用方不应在 C 函数内部释放该指针。
+- `bytes` → `c_char_p` 参数只传递数据指针，不自动追加 `\0`；需要传递 null-terminated 内容时调用方应自行在 bytes 末尾包含 `\0`（如 `b”hello\0”`）。
+- `POINTER(T)` 目前统一降级为 `ptr`（不跟踪 T 的静态类型信息）；未支持解引用或复合指针运算。
 - 当前实现直接面向 `dlopen` / `dlsym`，属于 POSIX-first 路径，不等于已完成跨平台装载层。
 
 ### 剩余工作
 
 | 特性 | 状态 | 说明 |
 |------|------|------|
-| 真实端到端运行时验证 | 🚧 | 当前测试重点是 analyzer / LLVM IR lowering；还缺“同一份代码直接运行与编译运行”的回归样例 |
-| `POINTER(T)` / 更完整指针类型系统 | ❌ | 当前类型解析尚未覆盖 `POINTER(T)` 这类组合形式 |
-| `bytes` / `c_char_p` 所有权与互操作 | ❌ | 需要和 `bytes` lowering、内存管理策略一起设计 |
+| 真实端到端运行时验证 | 🚧 | 测试覆盖 analyzer / LLVM IR；还缺”同一份 .py 直接运行与编译产物执行结果对比”的 regression |
+| `bytes` null-terminated 场景的便捷封装 | ❌ | 当前需要用户手动在 bytes 末尾包含 `\0`；可考虑提供 `ctypes.c_str(s: str)` 辅助 |
+| `POINTER(T)` 类型信息保留 | ❌ | 当前统一降级为 `ptr`；未来可考虑在 cfuncptr 类型字符串中保留 `ptr(T)` 信息用于更严格检查 |
+| `byref(obj)` / `addressof(obj)` | ❌ | 需要堆分配 + 指针语义；依赖 ARC / 所有权模型先落地 |
+| `ctypes.cast(val, type)` | ❌ | 指针重解释；在所有指针统一为 `ptr` 后实现较简单，但需要 analyzer 追踪目标类型 |
 | 跨平台动态装载抽象 | ❌ | Windows 下需要对应 `LoadLibrary` / `GetProcAddress` 路径 |
-| 更宽 ctypes API 覆盖 | ❌ | 目前只覆盖对静态编译最关键的 `CDLL` + `CFUNCTYPE` + 绑定调用链 |
+| Struct / Union 类型 (`ctypes.Structure`) | ❌ | C 结构体直接映射到 PyX class 的 FFI 路径；属于较大工作量 |
 
 ### 完成标准
-- 同一份 `.py` 文件既能被 `python` 直接运行，也能被 `pyx build` 编译后的产物稳定执行。
-- 能通过标准 `ctypes` 写法调用 libc / libm 函数（如 `puts`、`abs`、`sqrt`）并具备运行时回归测试。
-- 为指针/字符串参数建立明确且可文档化的 ABI 约束。
+- 同一份 `.py` 文件既能被 `python` 直接运行，也能被 `pyx build` 编译后的产物稳定执行（有 runtime regression 覆盖）。
+- 能通过标准 `ctypes` 写法调用 libc / libm 函数（如 `puts`、`abs`、`sqrt`、`getenv`）并具备运行时回归测试。
+- 为指针/字符串参数建立明确且可文档化的 ABI 约束（null-termination 要求、所有权语义等）。
 
 ---
 

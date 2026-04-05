@@ -142,8 +142,8 @@ def llvm_type(py_type: str) -> str:
         return BYTES_LLVM_TYPE
     if parse_list_type(normalized) is not None:
         return LIST_LLVM_TYPE
-    # Phase 4: cdll handles and function pointers are opaque pointers at runtime.
-    if normalized == CDLL_TYPE or is_cfuncptr_type(normalized):
+    # Phase 4: cdll handles, function pointers, and opaque Any are all ptr.
+    if normalized in {"Any", CDLL_TYPE} or is_cfuncptr_type(normalized):
         return "ptr"
     # File I/O: file handles are opaque FILE* pointers.
     if normalized in FILE_TYPES:
@@ -186,6 +186,7 @@ class _ModuleContext:
         self.uses_utf8_helpers = False
         self.uses_dlopen = False   # Phase 4: ctypes.CDLL
         self.uses_dlsym = False    # Phase 4: fn_t(("sym", lib))
+        self.uses_strlen = False   # Phase 4: c_char_p return → bytes
         # File I/O
         self.uses_fopen = False
         self.uses_fclose = False
@@ -277,12 +278,13 @@ class _ModuleContext:
             lines.append("declare i64 @fread(ptr, i64, i64, ptr)")
         if self.uses_file_readline:
             lines.append("declare ptr @fgets(ptr, i32, ptr)")
+        if self.uses_file_readline or self.uses_strlen:
             lines.append("declare i64 @strlen(ptr)")
         has_any_decl = (
             self.uses_printf or self.uses_malloc or self.uses_realloc
             or self.uses_memcpy or self.uses_abort or self.uses_dlopen
-            or self.uses_dlsym or self.uses_fopen or self.uses_fclose
-            or self.uses_fwrite or self.uses_file_read_text
+            or self.uses_dlsym or self.uses_strlen or self.uses_fopen
+            or self.uses_fclose or self.uses_fwrite or self.uses_file_read_text
             or self.uses_file_read_binary or self.uses_file_readline
         )
         if has_any_decl:
@@ -836,6 +838,8 @@ class _FunctionCompiler:
             return self._compile_cdll(node)
         if self._is_ctypes_call(node.func, "CFUNCTYPE"):
             return self._compile_cfunctype(node)
+        if self._is_ctypes_call(node.func, "string_at"):
+            return self._compile_string_at(node)
         if self._is_cfuncptr_binding(node):
             return self._compile_cfuncptr_binding(node)
         if self._is_cfuncptr_call(node):
@@ -1204,7 +1208,7 @@ class _FunctionCompiler:
         """Extract a ctypes type name from an AST expression node.
 
         Handles ``ctypes.c_int``, ``c_int`` (after ``from ctypes import``),
-        and ``None`` (void return).
+        ``ctypes.POINTER(T)`` (→ ``"c_void_p"``), and ``None`` (void return).
         """
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
             if node.attr in CTYPES_ALL_TYPES:
@@ -1217,6 +1221,9 @@ class _FunctionCompiler:
                 return sym.symbol_name
         if isinstance(node, ast.Constant) and node.value is None:
             return "None"
+        # POINTER(T) composite type — all pointers are opaque ptr in LLVM IR.
+        if isinstance(node, ast.Call) and self._is_ctypes_call(node.func, "POINTER"):
+            return "c_void_p"
         return None
 
     def _is_cfuncptr_binding(self, node: ast.Call) -> bool:
@@ -1255,6 +1262,33 @@ class _FunctionCompiler:
         reg = self._new_reg()
         self.body_lines.append(f"  {reg} = call ptr @dlopen(ptr {gname}, i32 1)")
         return reg, CDLL_TYPE
+
+    def _compile_string_at(self, node: ast.Call) -> tuple[str, str]:
+        """Compile ``ctypes.string_at(ptr, size)`` → ``%pyx.bytes`` struct.
+
+        Copies *size* bytes from the raw C pointer into a heap-allocated buffer
+        and wraps the result as a PyX ``bytes`` value.
+        """
+        if len(node.args) != 2:
+            raise CompileError(
+                "string_at() expects exactly 2 arguments (ptr, size)",
+                code=_ERR_CALL_ARG_COUNT,
+                line=node.lineno,
+                col=node.col_offset,
+            )
+        self.ctx.uses_malloc = True
+        self.ctx.uses_memcpy = True
+        ptr_val, _ = self._compile_expr(node.args[0])
+        size_val, size_t = self._compile_expr(node.args[1])
+        # size must be i64; extend from i32 if needed
+        if size_t == "int":
+            size_i64 = size_val
+        else:
+            size_i64 = size_val
+        buf_reg = self._new_reg()
+        self.body_lines.append(f"  {buf_reg} = call ptr @malloc(i64 {size_i64})")
+        self.body_lines.append(f"  call ptr @memcpy(ptr {buf_reg}, ptr {ptr_val}, i64 {size_i64})")
+        return self._build_bytes_value(buf_reg, size_i64), "bytes"
 
     def _compile_cfunctype(self, node: ast.Call) -> tuple[str, str]:
         """Compile ``ctypes.CFUNCTYPE(restype, *argtypes)`` → null ptr.
@@ -1371,6 +1405,21 @@ class _FunctionCompiler:
             reg = self._new_reg()
             self.body_lines.append(f"  {reg} = fptrunc double {value} to float")
             return reg
+        # str → c_char_p: extract the data pointer from the %pyx.str struct.
+        # PyX str data is always null-terminated (literals + concat both add \0).
+        if pyx_t == "str" and ctype == "c_char_p":
+            reg = self._new_reg()
+            self.body_lines.append(f"  {reg} = extractvalue {STR_LLVM_TYPE} {value}, 0")
+            return reg
+        # bytes → c_char_p: extract the data pointer from the %pyx.bytes struct.
+        # The caller is responsible for null-termination when required by the C API.
+        if pyx_t == "bytes" and ctype == "c_char_p":
+            reg = self._new_reg()
+            self.body_lines.append(f"  {reg} = extractvalue {BYTES_LLVM_TYPE} {value}, 0")
+            return reg
+        # Any (opaque ptr) → pointer-typed ctypes: pass through as-is.
+        if pyx_t == "Any" and target_llvm == "ptr":
+            return value
         raise CompileError(
             f"Cannot coerce PyX type '{pyx_t}' to ctypes '{ctype}'",
             code=_ERR_TYPE_MISMATCH,
@@ -1388,6 +1437,18 @@ class _FunctionCompiler:
             reg = self._new_reg()
             self.body_lines.append(f"  {reg} = fpext float {value} to double")
             return reg
+        # c_char_p → bytes: use strlen to discover length, then wrap in pyx.bytes struct.
+        if ctype == "c_char_p":
+            self.ctx.uses_strlen = True
+            self.ctx.uses_malloc = True
+            self.ctx.uses_memcpy = True
+            length_reg = self._new_reg()
+            buf_reg = self._new_reg()
+            self.body_lines.append(f"  {length_reg} = call i64 @strlen(ptr {value})")
+            # Copy into a heap buffer owned by the bytes value (no null terminator needed).
+            self.body_lines.append(f"  {buf_reg} = call ptr @malloc(i64 {length_reg})")
+            self.body_lines.append(f"  call ptr @memcpy(ptr {buf_reg}, ptr {value}, i64 {length_reg})")
+            return self._build_bytes_value(buf_reg, length_reg)
         return value  # already the right LLVM type (e.g. i64 / double / ptr)
 
     # ------------------------------------------------------------------
