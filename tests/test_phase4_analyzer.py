@@ -234,3 +234,190 @@ def f(n: int) -> int:
     )
     errors = Analyzer().analyze_path(src)
     assert any("CDLL handle" in e.message for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# POINTER(T) type support
+# ---------------------------------------------------------------------------
+
+
+def test_pointer_type_in_cfunctype_no_error(tmp_path: Path) -> None:
+    """POINTER(c_int) in CFUNCTYPE signature should be accepted."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def call_with_ptr(n: int) -> int:
+    lib = ctypes.CDLL("libc.so.6")
+    fn_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_int))
+    c_fn = fn_t(("some_fn", lib))
+    return n
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+def test_pointer_return_type_in_cfunctype(tmp_path: Path) -> None:
+    """POINTER(T) as return type in CFUNCTYPE should be accepted."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def get_ptr() -> int:
+    lib = ctypes.CDLL("libc.so.6")
+    fn_t = ctypes.CFUNCTYPE(ctypes.POINTER(ctypes.c_char), ctypes.c_int)
+    c_fn = fn_t(("alloc_buf", lib))
+    return 0
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# str / bytes → c_char_p argument coercion
+# ---------------------------------------------------------------------------
+
+
+def test_str_arg_to_c_char_p_no_error(tmp_path: Path) -> None:
+    """Passing a str to a c_char_p parameter should be accepted."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def call_puts(s: str) -> int:
+    lib = ctypes.CDLL("libc.so.6")
+    puts_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p)
+    c_puts = puts_t(("puts", lib))
+    return c_puts(s)
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+def test_bytes_arg_to_c_char_p_no_error(tmp_path: Path) -> None:
+    """Passing bytes to a c_char_p parameter should be accepted."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def call_puts_bytes(s: bytes) -> int:
+    lib = ctypes.CDLL("libc.so.6")
+    puts_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p)
+    c_puts = puts_t(("puts", lib))
+    return c_puts(s)
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+def test_int_arg_to_c_char_p_is_error(tmp_path: Path) -> None:
+    """Passing int to a c_char_p parameter should report a type error."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def bad_call(n: int) -> int:
+    lib = ctypes.CDLL("libc.so.6")
+    puts_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p)
+    c_puts = puts_t(("puts", lib))
+    return c_puts(n)
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert any("c_char_p" in e.message for e in errors)
+
+
+def test_str_arg_to_c_int_is_error(tmp_path: Path) -> None:
+    """Passing str to a c_int parameter should report a type error."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def bad_call(s: str) -> int:
+    lib = ctypes.CDLL("libc.so.6")
+    abs_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)
+    c_abs = abs_t(("abs", lib))
+    return c_abs(s)
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert any("c_int" in e.message for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# c_char_p return → bytes
+# ---------------------------------------------------------------------------
+
+
+def test_c_char_p_return_inferred_as_bytes(tmp_path: Path) -> None:
+    """A function returning c_char_p should yield type bytes at the call site."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def get_env(name: str) -> bytes:
+    lib = ctypes.CDLL("libc.so.6")
+    getenv_t = ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_char_p)
+    c_getenv = getenv_t(("getenv", lib))
+    result = c_getenv(name)
+    return result
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+# ---------------------------------------------------------------------------
+# ctypes.string_at(ptr, size) → bytes
+# ---------------------------------------------------------------------------
+
+
+def test_string_at_returns_bytes(tmp_path: Path) -> None:
+    """ctypes.string_at(ptr, size) should return bytes with no errors."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def read_buf(n: int) -> bytes:
+    lib = ctypes.CDLL("libc.so.6")
+    fn_t = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)
+    c_fn = fn_t(("some_fn", lib))
+    ptr = c_fn(n)
+    data = ctypes.string_at(ptr, n)
+    return data
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+def test_string_at_wrong_size_type(tmp_path: Path) -> None:
+    """string_at() with a non-int size should report a type error."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def bad(s: str, n: int) -> bytes:
+    lib = ctypes.CDLL("libc.so.6")
+    fn_t = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)
+    c_fn = fn_t(("some_fn", lib))
+    ptr = c_fn(n)
+    data = ctypes.string_at(ptr, s)
+    return data
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert any("size" in e.message for e in errors)

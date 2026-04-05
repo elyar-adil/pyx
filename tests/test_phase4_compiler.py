@@ -250,3 +250,152 @@ def f(name: str) -> int:
     )
     with pytest.raises(CompileError, match="string-literal"):
         LLVMCompiler.from_path(src).compile_ir()
+
+
+# ---------------------------------------------------------------------------
+# POINTER(T) type support
+# ---------------------------------------------------------------------------
+
+
+def test_pointer_type_in_cfunctype_uses_ptr(tmp_path: Path) -> None:
+    """POINTER(c_int) in CFUNCTYPE should lower to ptr in the indirect call."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def call_fn(n: int) -> int:
+    lib = ctypes.CDLL("libc.so.6")
+    fn_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_int))
+    c_fn = fn_t(("some_fn", lib))
+    return n
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "@dlopen" in ir
+    assert "@dlsym" in ir
+    # cfuncptr type string captures c_void_p for POINTER(c_int)
+    assert "store ptr null" in ir
+
+
+# ---------------------------------------------------------------------------
+# str / bytes → c_char_p coercion
+# ---------------------------------------------------------------------------
+
+
+def test_str_to_c_char_p_extracts_ptr(tmp_path: Path) -> None:
+    """Passing str to a c_char_p parameter should emit extractvalue on the str struct."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def call_puts(s: str) -> int:
+    lib = ctypes.CDLL("libc.so.6")
+    puts_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p)
+    c_puts = puts_t(("puts", lib))
+    return c_puts(s)
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    # str data ptr is extracted via extractvalue index 0
+    assert "extractvalue %pyx.str" in ir
+    assert "call i32 (ptr)" in ir
+    # No integer truncation needed for ptr args
+    assert "trunc" not in ir
+
+
+def test_bytes_to_c_char_p_extracts_ptr(tmp_path: Path) -> None:
+    """Passing bytes to a c_char_p parameter should emit extractvalue on the bytes struct."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def call_fn(b: bytes) -> int:
+    lib = ctypes.CDLL("libc.so.6")
+    fn_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p)
+    c_fn = fn_t(("write_buf", lib))
+    return c_fn(b)
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "extractvalue %pyx.bytes" in ir
+    assert "call i32 (ptr)" in ir
+
+
+# ---------------------------------------------------------------------------
+# c_char_p return → bytes (via strlen)
+# ---------------------------------------------------------------------------
+
+
+def test_c_char_p_return_emits_strlen(tmp_path: Path) -> None:
+    """A c_char_p-returning function should emit strlen and build a bytes struct."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def get_env(name: str) -> bytes:
+    lib = ctypes.CDLL("libc.so.6")
+    getenv_t = ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_char_p)
+    c_getenv = getenv_t(("getenv", lib))
+    return c_getenv(name)
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "declare i64 @strlen(ptr)" in ir
+    assert "call i64 @strlen(ptr" in ir
+    # The return type of the function is %pyx.bytes
+    assert "define %pyx.bytes @get_env" in ir
+
+
+# ---------------------------------------------------------------------------
+# ctypes.string_at(ptr, size) → bytes
+# ---------------------------------------------------------------------------
+
+
+def test_string_at_builds_bytes_struct(tmp_path: Path) -> None:
+    """ctypes.string_at(ptr, size) should malloc, memcpy, and return a bytes value."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def read_buf(n: int) -> bytes:
+    lib = ctypes.CDLL("libc.so.6")
+    fn_t = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)
+    c_fn = fn_t(("some_fn", lib))
+    ptr = c_fn(n)
+    return ctypes.string_at(ptr, n)
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "call ptr @malloc" in ir
+    assert "call ptr @memcpy" in ir
+    assert "define %pyx.bytes @read_buf" in ir
+
+
+# ---------------------------------------------------------------------------
+# Any-typed opaque pointer variables (c_void_p return)
+# ---------------------------------------------------------------------------
+
+
+def test_c_void_p_return_stored_as_ptr(tmp_path: Path) -> None:
+    """A c_void_p return value should be storable in an Any-typed variable."""
+    src = write_tmp(
+        tmp_path,
+        """
+import ctypes
+
+def get_ptr(n: int) -> int:
+    lib = ctypes.CDLL("libc.so.6")
+    fn_t = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)
+    c_fn = fn_t(("malloc", lib))
+    ptr = c_fn(n)
+    return n
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    # ptr variable slot should be alloca ptr
+    assert "alloca ptr" in ir

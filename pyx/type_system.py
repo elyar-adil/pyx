@@ -72,8 +72,9 @@ def ctypes_to_pyx_type(ctype: str) -> str:
     """Map a ctypes return-type name to the corresponding PyX value type.
 
     Integer ctypes types map to ``"int"``, float types to ``"float"``,
-    ``"None"`` (void) to ``"None"``, and pointer types to ``"Any"`` (not yet
-    fully supported).
+    ``"None"`` (void) to ``"None"``, ``"c_char_p"`` to ``"bytes"``
+    (raw C string → length-bearing bytes value via strlen), and remaining
+    pointer types to ``"Any"`` (opaque pointer — maps to ``ptr`` in LLVM IR).
     """
     if ctype in CTYPES_INT_TYPES:
         return "int"
@@ -81,7 +82,9 @@ def ctypes_to_pyx_type(ctype: str) -> str:
         return "float"
     if ctype == "None":
         return "None"
-    return "Any"  # pointer / unknown → opaque for now
+    if ctype == "c_char_p":
+        return "bytes"  # C char* → PyX bytes (length determined via strlen)
+    return "Any"  # c_void_p / c_wchar_p / unknown → opaque ptr
 
 
 def normalize_type_name(type_name: str) -> str:
@@ -146,8 +149,8 @@ def is_supported_type(type_name: str, known_types: set[str] | frozenset[str] | N
     normalized = normalize_type_name(type_name)
     if normalized in PRIMITIVE_TYPES or normalized == NUMERIC_UNION:
         return True
-    # Phase 4: ctypes FFI types
-    if normalized == CDLL_TYPE or is_cfuncptr_type(normalized):
+    # Phase 4: ctypes FFI types; "Any" = opaque ptr (e.g. c_void_p return)
+    if normalized in {"Any", CDLL_TYPE} or is_cfuncptr_type(normalized):
         return True
 
     # File I/O types

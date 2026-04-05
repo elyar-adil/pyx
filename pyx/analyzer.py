@@ -470,6 +470,8 @@ class Analyzer:
             return self._infer_cdll_call(node, ctx)
         if self._is_ctypes_call(node.func, "CFUNCTYPE", ctx):
             return self._infer_cfunctype_call(node, ctx)
+        if self._is_ctypes_call(node.func, "string_at", ctx):
+            return self._infer_string_at_call(node, ctx)
         # cfuncptr variable invocation (binding or indirect call)
         if isinstance(node.func, ast.Name) and node.func.id in ctx.locals:
             func_t = ctx.locals[node.func.id]
@@ -577,7 +579,7 @@ class Analyzer:
         """Extract a ctypes type name (e.g. ``"c_int"``) from an AST expression.
 
         Handles ``ctypes.c_int``, ``c_int`` (after ``from ctypes import``),
-        and ``None`` (meaning void / no return value).
+        ``ctypes.POINTER(T)`` (→ ``"c_void_p"``), and ``None`` (void return).
         Returns *None* if the node is not a recognised ctypes type.
         """
         if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
@@ -591,6 +593,9 @@ class Analyzer:
                 return sym.symbol_name
         if isinstance(node, ast.Constant) and node.value is None:
             return "None"
+        # POINTER(T) composite type — all C pointer types are opaque ptr at LLVM level.
+        if isinstance(node, ast.Call) and self._is_ctypes_call(node.func, "POINTER", ctx):
+            return "c_void_p"
         return None
 
     def _infer_cdll_call(self, node: ast.Call, ctx: _FunctionContext) -> str:
@@ -655,9 +660,47 @@ class Analyzer:
         if len(node.args) != len(arg_ctypes):
             self._error(node, _ERR_CALL_ARG_COUNT,
                         f"Function pointer call expects {len(arg_ctypes)} argument(s), got {len(node.args)}")
-        for arg_node in node.args:
-            self._infer_expr_type(arg_node, ctx)  # validate sub-expressions
+        for arg_node, expected_ctype in zip(node.args, arg_ctypes):
+            arg_t = self._infer_expr_type(arg_node, ctx)
+            self._check_ctypes_arg_compat(arg_node, arg_t, expected_ctype)
         return ctypes_to_pyx_type(ret_ctype)
+
+    def _check_ctypes_arg_compat(self, node: ast.AST, pyx_t: str, ctype: str) -> None:
+        """Emit PYX1011 if *pyx_t* is not compatible with the ctypes parameter *ctype*.
+
+        ``Any`` is always accepted (opaque / unknown origin).
+        """
+        from .type_system import CTYPES_INT_TYPES, CTYPES_FLOAT_TYPES
+        if pyx_t == "Any":
+            return
+        if ctype in CTYPES_INT_TYPES:
+            if pyx_t != "int":
+                self._error(node, _ERR_CALL_ARG_TYPE,
+                            f"ctypes type '{ctype}' expects int, got '{pyx_t}'")
+        elif ctype in CTYPES_FLOAT_TYPES:
+            if pyx_t not in {"float", "int"}:
+                self._error(node, _ERR_CALL_ARG_TYPE,
+                            f"ctypes type '{ctype}' expects float, got '{pyx_t}'")
+        elif ctype == "c_char_p":
+            if pyx_t not in {"str", "bytes"}:
+                self._error(node, _ERR_CALL_ARG_TYPE,
+                            f"ctypes type 'c_char_p' expects str or bytes, got '{pyx_t}'")
+        # c_void_p / c_wchar_p: accept any value (opaque pointer semantics)
+
+    def _infer_string_at_call(self, node: ast.Call, ctx: _FunctionContext) -> str:
+        """Type-check ``ctypes.string_at(ptr, size)`` → ``bytes``."""
+        if len(node.args) != 2:
+            self._error(node, _ERR_CALL_ARG_COUNT,
+                        "string_at() expects exactly 2 arguments (ptr, size)")
+            return "bytes"
+        # First arg: raw pointer — Any is expected (e.g. c_void_p return value).
+        self._infer_expr_type(node.args[0], ctx)
+        # Second arg: size as int.
+        size_t = self._infer_expr_type(node.args[1], ctx)
+        if size_t not in {"int", "Any"}:
+            self._error(node.args[1], _ERR_CALL_ARG_TYPE,
+                        f"string_at() size must be int, got '{size_t}'")
+        return "bytes"
 
     # ------------------------------------------------------------------
     # File I/O helpers
