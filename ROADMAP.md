@@ -75,7 +75,7 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 |------|------|------|
 | `str[i:j]` 切片 | ❌ | 需要 `malloc + memcpy`；索引路径已具备基础 |
 | `str` 比较（`==`, `!=`） | ❌ | 当前会显式报“planned but not lowered”，尚未接入 `memcmp` |
-| `dict[K, V]` LLVM lowering | ❌ | Analyzer 已支持类型推断；Compiler 尚未实现哈希表布局与操作 |
+| `dict[K, V]` LLVM lowering | 🚧 | 已收敛为静态类型原生哈希表；P0 已支持 `{}`（需显式类型上下文）、同构字面量、`d[k]`、`d[k] = v`、`k in d`、`len(d)`、`d.get(k, default)` |
 | `set[T]` LLVM lowering | ❌ | Analyzer 可推断类型；Compiler 明确拦截 |
 | `bytes` 扩展操作（索引 / 切片 / 比较） | ❌ | 当前只覆盖字面量、`len()` 与二进制文件 I/O 主路径 |
 | 更完整文件 API（`seek` / `tell` / 迭代 / 追加语义） | ❌ | 当前只覆盖 `read` / `readline` / `write` / `close` |
@@ -86,9 +86,16 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 | 循环引用收集器 | ❌ | 依赖 ARC 先落地 |
 | 逃逸分析 | ❌ | 归入 Phase 6 优化项 |
 
+### `dict[K, V]` P0 当前边界
+- 目标是静态类型、同构键值的原生哈希表，不追求完整 Python dict 语义。
+- 当前 key 支持：`int`、`bool`、`str`、`bytes`，以及字段递归可哈希的固定布局 class。
+- 当前操作支持：`{}`（需要显式类型上下文）、同构非空字面量、`d[k]`、`d[k] = v`、`k in d`、`len(d)`、`d.get(k, default)`。
+- 当前不支持：`items()` / `keys()` / `values()`、`pop()` / `clear()` / `del`、dict 迭代、dict equality、完整 Python 对象身份语义。
+
 ### 完成标准
 - 支持包含多模块、`list[T]` / `class` / `str` 操作的完整示例项目编译并运行。
 - `dict[K, V]` 基础操作（set / get）端到端通过。
+- `dict[K, V]` 的 P0 key 规则稳定：`int` / `bool` / `str` / `bytes`，以及字段递归可哈希的固定布局 class。
 - 为 heap 值建立明确的所有权/释放策略，不再长期依赖“只分配不释放”。
 - 文件 I/O 从“可用”推进到“可写真实脚本”的完整运行时子集。
 

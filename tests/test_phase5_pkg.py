@@ -22,7 +22,7 @@ from pyx.pkg.semver import Version, best_matching, matches_constraint
 from pyx.pkg.manifest import ManifestError, PackageManifest, load_manifest, save_manifest
 from pyx.pkg.registry import Registry, RegistryError
 from pyx.pkg.resolver import LockFile, LockedPackage, ResolveError, resolve_dependencies
-from pyx.pkg.installer import InstallError, install_package, publish_package, install_from_manifest
+from pyx.pkg.installer import InstallError, install_package, install_requirement, publish_package, install_from_manifest
 from pyx.cli import cmd_pkg_install, cmd_pkg_publish
 
 
@@ -210,6 +210,84 @@ def _make_archive(tmp_path: Path, name: str, version: str, files: dict[str, str]
     return archive_path
 
 
+def _publish_source_package(
+    tmp_path: Path,
+    registry: Registry,
+    name: str,
+    version: str,
+    files: dict[str, str],
+    dependencies: dict[str, str] | None = None,
+) -> Path:
+    src = tmp_path / f"{name}-{version}-src"
+    src.mkdir()
+    manifest = PackageManifest(
+        name=name,
+        version=version,
+        dependencies=dependencies or {},
+    )
+    save_manifest(manifest, src / "pyx.toml")
+    for rel_path, content in files.items():
+        dest = src / rel_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+    publish_package(src, manifest, registry)
+    return src
+
+
+def _publish_requests_stack(tmp_path: Path) -> Registry:
+    reg = Registry(tmp_path / "reg")
+    _publish_source_package(
+        tmp_path,
+        reg,
+        "urllib3",
+        "2.0.0",
+        {"urllib3.py": "VERSION: str = '2.0.0'\n"},
+    )
+    _publish_source_package(
+        tmp_path,
+        reg,
+        "certifi",
+        "2026.1.0",
+        {"certifi.py": "CA_BUNDLE: str = '/etc/ssl/certs.pem'\n"},
+    )
+    _publish_source_package(
+        tmp_path,
+        reg,
+        "charset-normalizer",
+        "3.0.0",
+        {"charset_normalizer.py": "ENCODING: str = 'utf-8'\n"},
+    )
+    _publish_source_package(
+        tmp_path,
+        reg,
+        "idna",
+        "3.0.0",
+        {"idna.py": "def encode(host: str) -> str:\n    return host\n"},
+    )
+    _publish_source_package(
+        tmp_path,
+        reg,
+        "requests",
+        "1.0.0",
+        {
+            "requests/__init__.py": (
+                "import urllib3\n"
+                "import certifi\n"
+                "import charset_normalizer\n"
+                "import idna\n\n"
+                "VERSION: str = '1.0.0'\n"
+            ),
+        },
+        dependencies={
+            "urllib3": ">=2.0.0",
+            "certifi": ">=2026.1.0",
+            "charset-normalizer": ">=3.0.0",
+            "idna": ">=3.0.0",
+        },
+    )
+    return reg
+
+
 class TestRegistry:
     def test_publish_and_list(self, tmp_path):
         reg = Registry(tmp_path / "reg")
@@ -318,6 +396,100 @@ class TestResolver:
         lock = resolve_dependencies(manifest, reg)
         assert lock.packages[0].version == "1.2.0"
 
+    def test_resolve_transitive_requests_stack(self, tmp_path):
+        reg = _publish_requests_stack(tmp_path)
+        manifest = PackageManifest(name="app", version="0.1.0", dependencies={"requests": "*"})
+
+        lock = resolve_dependencies(manifest, reg)
+
+        assert [pkg.name for pkg in lock.packages] == [
+            "urllib3",
+            "certifi",
+            "charset-normalizer",
+            "idna",
+            "requests",
+        ]
+
+    def test_resolve_conflicting_transitive_dependency_raises(self, tmp_path):
+        reg = Registry(tmp_path / "reg")
+        _publish_source_package(
+            tmp_path,
+            reg,
+            "idna",
+            "2.0.0",
+            {"idna.py": "VERSION: str = '2.0.0'\n"},
+        )
+        _publish_source_package(
+            tmp_path,
+            reg,
+            "idna",
+            "3.0.0",
+            {"idna.py": "VERSION: str = '3.0.0'\n"},
+        )
+        _publish_source_package(
+            tmp_path,
+            reg,
+            "requests",
+            "1.0.0",
+            {"requests/__init__.py": "VERSION: str = '1.0.0'\n"},
+            dependencies={"idna": ">=3.0.0"},
+        )
+        manifest = PackageManifest(
+            name="app",
+            version="0.1.0",
+            dependencies={"idna": "<3.0.0", "requests": "*"},
+        )
+
+        with pytest.raises(ResolveError, match="dependency conflict"):
+            resolve_dependencies(manifest, reg)
+
+    def test_resolve_cyclic_dependency_conflict_raises(self, tmp_path):
+        reg = Registry(tmp_path / "reg")
+        _publish_source_package(
+            tmp_path,
+            reg,
+            "a",
+            "1.0.0",
+            {"a.py": "NAME: str = 'a'\n"},
+            dependencies={"b": "*"},
+        )
+        _publish_source_package(
+            tmp_path,
+            reg,
+            "b",
+            "1.0.0",
+            {"b.py": "NAME: str = 'b'\n"},
+            dependencies={"a": ">=2.0.0"},
+        )
+        manifest = PackageManifest(name="app", version="0.1.0", dependencies={"a": "*"})
+
+        with pytest.raises(ResolveError, match="dependency conflict"):
+            resolve_dependencies(manifest, reg)
+
+    def test_resolve_cyclic_dependency_with_compatible_constraints(self, tmp_path):
+        reg = Registry(tmp_path / "reg")
+        _publish_source_package(
+            tmp_path,
+            reg,
+            "a",
+            "1.0.0",
+            {"a.py": "NAME: str = 'a'\n"},
+            dependencies={"b": "*"},
+        )
+        _publish_source_package(
+            tmp_path,
+            reg,
+            "b",
+            "1.0.0",
+            {"b.py": "NAME: str = 'b'\n"},
+            dependencies={"a": ">=1.0.0"},
+        )
+        manifest = PackageManifest(name="app", version="0.1.0", dependencies={"a": "*"})
+
+        lock = resolve_dependencies(manifest, reg)
+
+        assert [pkg.name for pkg in lock.packages] == ["b", "a"]
+
 
 # ===========================================================================
 # Installer
@@ -404,6 +576,44 @@ class TestInstaller:
         assert (proj / "pyx_packages" / "dep" / "dep.py").exists()
         assert (proj / "pyx.lock").exists()
 
+    def test_install_from_manifest_installs_transitive_requests_stack(self, tmp_path):
+        reg = _publish_requests_stack(tmp_path)
+        proj = tmp_path / "project"
+        proj.mkdir()
+        (proj / "pyx.toml").write_text(
+            '[package]\nname = "client"\nversion = "0.1.0"\n\n[dependencies]\nrequests = "*"\n',
+            encoding="utf-8",
+        )
+
+        manifest = load_manifest(proj / "pyx.toml")
+        lock = install_from_manifest(manifest, reg, proj)
+
+        assert [pkg.name for pkg in lock.packages] == [
+            "urllib3",
+            "certifi",
+            "charset-normalizer",
+            "idna",
+            "requests",
+        ]
+        assert (proj / "pyx_packages" / "requests" / "requests" / "__init__.py").exists()
+        assert (proj / "pyx_packages" / "charset-normalizer" / "charset_normalizer.py").exists()
+        lock_data = json.loads((proj / "pyx.lock").read_text(encoding="utf-8"))
+        assert [pkg["name"] for pkg in lock_data["packages"]] == [pkg.name for pkg in lock.packages]
+
+    def test_install_rejects_path_traversal_archive(self, tmp_path):
+        reg = Registry(tmp_path / "reg")
+        archive = tmp_path / "evil-1.0.0.tar.gz"
+        escaped = tmp_path / "escaped.py"
+        with tarfile.open(archive, "w:gz") as tf:
+            payload = tmp_path / "payload.py"
+            payload.write_text("X: int = 1\n", encoding="utf-8")
+            tf.add(payload, arcname="../escaped.py")
+        reg.publish(archive, "evil", "1.0.0")
+
+        with pytest.raises(InstallError, match="unsafe archive member"):
+            install_package("evil", reg, tmp_path / "pkgs")
+        assert not escaped.exists()
+
 
 # ===========================================================================
 # CLI commands
@@ -443,6 +653,19 @@ class TestCLIPkg:
         assert rc == 1
         assert "error:" in out
 
+    def test_cmd_pkg_install_installs_transitive_requests_stack(self, tmp_path, capsys):
+        reg = _publish_requests_stack(tmp_path)
+
+        rc = cmd_pkg_install("requests", reg.path, tmp_path / "project")
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "Installed requests" in out
+        assert (tmp_path / "project" / "pyx_packages" / "requests" / "requests" / "__init__.py").exists()
+        assert (tmp_path / "project" / "pyx_packages" / "idna" / "idna.py").exists()
+        lock_data = json.loads((tmp_path / "project" / "pyx.lock").read_text(encoding="utf-8"))
+        assert lock_data["packages"][-1]["name"] == "requests"
+
 
 # ===========================================================================
 # project.py pyx_packages/ search path
@@ -478,6 +701,45 @@ class TestProjectPkgSearchPath:
 
         project = load_project(main)
         assert "flatmod" in project.modules
+
+    def test_import_installed_package_directory(self, tmp_path):
+        """A published package directory with __init__.py should be importable."""
+        from pyx.project import load_project
+
+        reg = _publish_requests_stack(tmp_path)
+        consumer = tmp_path / "consumer"
+        consumer.mkdir()
+        install_requirement("requests", reg, consumer)
+
+        main = consumer / "main.py"
+        main.write_text("import requests\n", encoding="utf-8")
+
+        project = load_project(main)
+        assert "requests" in project.modules
+        assert project.modules["requests"].path.name == "__init__.py"
+
+    def test_import_hyphen_named_package_module(self, tmp_path):
+        """Import names should resolve even when the published package directory uses dashes."""
+        from pyx.project import load_project
+
+        reg = Registry(tmp_path / "reg")
+        _publish_source_package(
+            tmp_path,
+            reg,
+            "charset-normalizer",
+            "3.0.0",
+            {"charset_normalizer.py": "ENCODING: str = 'utf-8'\n"},
+        )
+
+        consumer = tmp_path / "consumer"
+        consumer.mkdir()
+        install_package("charset-normalizer", reg, consumer / "pyx_packages")
+
+        main = consumer / "main.py"
+        main.write_text("import charset_normalizer\n", encoding="utf-8")
+
+        project = load_project(main)
+        assert "charset_normalizer" in project.modules
 
 
 # ===========================================================================

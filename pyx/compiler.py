@@ -6,7 +6,14 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .project import ClassInfo, FunctionSignature, ModuleInfo, ProjectInfo, ProjectLoadError, load_project
+from .project import (
+    ClassInfo,
+    FunctionSignature,
+    ModuleInfo,
+    ProjectInfo,
+    ProjectLoadError,
+    load_project,
+)
 from .type_system import (
     BIN_FILE_TYPE,
     CDLL_TYPE,
@@ -35,6 +42,7 @@ UNION_LLVM_TYPE = "{ i1, double }"
 STR_LLVM_TYPE = "%pyx.str"
 LIST_LLVM_TYPE = "%pyx.list"
 BYTES_LLVM_TYPE = "%pyx.bytes"
+DICT_LLVM_TYPE = "%pyx.dict"
 
 # ---------------------------------------------------------------------------
 # Phase 4: ctypes / C ABI FFI
@@ -130,6 +138,54 @@ def _class_type_name(qualified_name: str) -> str:
     return f"%type.{_mangle_path(qualified_name)}"
 
 
+def _mangle_type_name(type_name: str) -> str:
+    return (
+        normalize_type_name(type_name)
+        .replace(" ", "")
+        .replace(".", "__")
+        .replace("[", "_")
+        .replace("]", "")
+        .replace(",", "__")
+        .replace("|", "_or_")
+    )
+
+
+def _dict_entry_type_name(dict_type: str) -> str:
+    return f"%pyx.dict.entry.{_mangle_type_name(dict_type)}"
+
+
+def _dict_insert_raw_name(dict_type: str) -> str:
+    return f"@__pyx_dict_insert_raw__{_mangle_type_name(dict_type)}"
+
+
+def _dict_grow_name(dict_type: str) -> str:
+    return f"@__pyx_dict_grow__{_mangle_type_name(dict_type)}"
+
+
+def _dict_new_name(dict_type: str) -> str:
+    return f"@__pyx_dict_new__{_mangle_type_name(dict_type)}"
+
+
+def _dict_set_name(dict_type: str) -> str:
+    return f"@__pyx_dict_set__{_mangle_type_name(dict_type)}"
+
+
+def _dict_try_get_name(dict_type: str) -> str:
+    return f"@__pyx_dict_try_get__{_mangle_type_name(dict_type)}"
+
+
+def _dict_contains_name(dict_type: str) -> str:
+    return f"@__pyx_dict_contains__{_mangle_type_name(dict_type)}"
+
+
+def _hash_helper_name(type_name: str) -> str:
+    return f"@__pyx_hash__{_mangle_type_name(type_name)}"
+
+
+def _eq_helper_name(type_name: str) -> str:
+    return f"@__pyx_eq__{_mangle_type_name(type_name)}"
+
+
 def llvm_type(py_type: str) -> str:
     normalized = normalize_type_name(py_type)
     if is_union_type(normalized):
@@ -142,6 +198,8 @@ def llvm_type(py_type: str) -> str:
         return BYTES_LLVM_TYPE
     if parse_list_type(normalized) is not None:
         return LIST_LLVM_TYPE
+    if parse_dict_type(normalized) is not None:
+        return DICT_LLVM_TYPE
     # Phase 4: cdll handles, function pointers, and opaque Any are all ptr.
     if normalized in {"Any", CDLL_TYPE} or is_cfuncptr_type(normalized):
         return "ptr"
@@ -186,6 +244,7 @@ class _ModuleContext:
         self.uses_utf8_helpers = False
         self.uses_dlopen = False   # Phase 4: ctypes.CDLL
         self.uses_dlsym = False    # Phase 4: fn_t(("sym", lib))
+        self.uses_dict_runtime = False
         self.uses_strlen = False   # Phase 4: c_char_p return → bytes
         # File I/O
         self.uses_fopen = False
@@ -198,6 +257,7 @@ class _ModuleContext:
         self._str_globals: list[tuple[str, str]] = []
         self._bytes_by_value: dict[bytes, str] = {}
         self._bytes_globals: list[tuple[str, bytes]] = []
+        self._dict_types: set[str] = set()
 
     def alloc_string(self, value: str) -> str:
         if value not in self._str_by_value:
@@ -213,6 +273,10 @@ class _ModuleContext:
             self._bytes_globals.append((name, value))
         return self._bytes_by_value[value]
 
+    def register_dict_type(self, dict_type: str) -> None:
+        self._dict_types.add(normalize_type_name(dict_type))
+        self.uses_dict_runtime = True
+
     def function_symbol(self, signature: FunctionSignature) -> str:
         if signature.class_name is not None:
             if signature.module_name == self.entry_module:
@@ -225,6 +289,9 @@ class _ModuleContext:
     def emit_preamble(self) -> list[str]:
         if self.uses_utf8_helpers:
             self.uses_abort = True
+        if self._dict_types:
+            self.uses_malloc = True
+            self.uses_realloc = True
         # File read helpers require malloc, fseek, ftell, fread, fgets, strlen, memcpy.
         if self.uses_file_read_text or self.uses_file_read_binary:
             self.uses_malloc = True
@@ -235,7 +302,13 @@ class _ModuleContext:
             f"{STR_LLVM_TYPE} = type {{ ptr, i64 }}",
             f"{BYTES_LLVM_TYPE} = type {{ ptr, i64 }}",
             f"{LIST_LLVM_TYPE} = type {{ ptr, i64, i64 }}",
+            f"{DICT_LLVM_TYPE} = type {{ ptr, i64, i64 }}",
         ]
+        for dict_type in sorted(self._dict_types):
+            key_t, value_t = parse_dict_type(dict_type)  # type: ignore[misc]
+            lines.append(
+                f"{_dict_entry_type_name(dict_type)} = type {{ i1, {llvm_type(key_t)}, {llvm_type(value_t)} }}"
+            )
         for module in self.project.modules.values():
             for _, class_info in module.classes.values():
                 fields = ", ".join(llvm_type(field_t) for field_t in class_info.field_types)
@@ -291,6 +364,8 @@ class _ModuleContext:
             lines.append("")
         if self.uses_utf8_helpers:
             lines.extend(self._emit_utf8_helpers())
+        if self._dict_types:
+            lines.extend(self._emit_dict_helpers())
         if self.uses_file_read_text:
             lines.extend(self._emit_file_read_text_helper())
         if self.uses_file_read_binary:
@@ -368,6 +443,439 @@ class _ModuleContext:
             "trap:",
             "  call void @abort()",
             "  unreachable",
+            "}",
+            "",
+        ]
+
+    def _emit_dict_helpers(self) -> list[str]:
+        self.uses_abort = True
+        lines: list[str] = []
+        lines.extend(self._emit_zero_alloc_helper())
+        lines.extend(self._emit_hash_bytes_helper())
+        lines.extend(self._emit_bytes_eq_helper())
+
+        emitted_hash: set[str] = set()
+        emitted_eq: set[str] = set()
+        for dict_type in sorted(self._dict_types):
+            key_t, _ = parse_dict_type(dict_type)  # type: ignore[misc]
+            lines.extend(self._emit_hash_helper_for_type(key_t, emitted_hash))
+            lines.extend(self._emit_eq_helper_for_type(key_t, emitted_eq))
+        for dict_type in sorted(self._dict_types):
+            lines.extend(self._emit_single_dict_helpers(dict_type))
+        return lines
+
+    def _emit_zero_alloc_helper(self) -> list[str]:
+        return [
+            "define private ptr @__pyx_alloc_zeroed(i64 %size) {",
+            "entry:",
+            "  %buf = call ptr @malloc(i64 %size)",
+            "  br label %loop",
+            "loop:",
+            "  %i = phi i64 [0, %entry], [%next_i, %body]",
+            "  %done = icmp eq i64 %i, %size",
+            "  br i1 %done, label %exit, label %body",
+            "body:",
+            "  %ptr = getelementptr i8, ptr %buf, i64 %i",
+            "  store i8 0, ptr %ptr",
+            "  %next_i = add i64 %i, 1",
+            "  br label %loop",
+            "exit:",
+            "  ret ptr %buf",
+            "}",
+            "",
+        ]
+
+    def _emit_hash_bytes_helper(self) -> list[str]:
+        return [
+            "define private i64 @__pyx_hash_bytes_raw(ptr %data, i64 %len) {",
+            "entry:",
+            "  br label %loop",
+            "loop:",
+            "  %i = phi i64 [0, %entry], [%next_i, %body]",
+            "  %hash = phi i64 [1469598103934665603, %entry], [%next_hash, %body]",
+            "  %done = icmp eq i64 %i, %len",
+            "  br i1 %done, label %exit, label %body",
+            "body:",
+            "  %ptr = getelementptr i8, ptr %data, i64 %i",
+            "  %byte = load i8, ptr %ptr",
+            "  %wide = zext i8 %byte to i64",
+            "  %xored = xor i64 %hash, %wide",
+            "  %next_hash = mul i64 %xored, 1099511628211",
+            "  %next_i = add i64 %i, 1",
+            "  br label %loop",
+            "exit:",
+            "  ret i64 %hash",
+            "}",
+            "",
+        ]
+
+    def _emit_bytes_eq_helper(self) -> list[str]:
+        return [
+            "define private i1 @__pyx_bytes_eq_raw(ptr %left_data, i64 %left_len, ptr %right_data, i64 %right_len) {",
+            "entry:",
+            "  %same_len = icmp eq i64 %left_len, %right_len",
+            "  br i1 %same_len, label %loop, label %ret_false",
+            "loop:",
+            "  %i = phi i64 [0, %entry], [%next_i, %advance]",
+            "  %done = icmp eq i64 %i, %left_len",
+            "  br i1 %done, label %ret_true, label %compare",
+            "compare:",
+            "  %left_ptr = getelementptr i8, ptr %left_data, i64 %i",
+            "  %right_ptr = getelementptr i8, ptr %right_data, i64 %i",
+            "  %left_byte = load i8, ptr %left_ptr",
+            "  %right_byte = load i8, ptr %right_ptr",
+            "  %match = icmp eq i8 %left_byte, %right_byte",
+            "  br i1 %match, label %advance, label %ret_false",
+            "advance:",
+            "  %next_i = add i64 %i, 1",
+            "  br label %loop",
+            "ret_false:",
+            "  ret i1 0",
+            "ret_true:",
+            "  ret i1 1",
+            "}",
+            "",
+        ]
+
+    def _emit_hash_helper_for_type(self, type_name: str, emitted: set[str]) -> list[str]:
+        normalized = normalize_type_name(type_name)
+        if normalized in emitted:
+            return []
+        emitted.add(normalized)
+
+        if normalized == "int":
+            return [
+                f"define private i64 {_hash_helper_name(normalized)}(i64 %value) {{",
+                "entry:",
+                "  %mixed = mul i64 %value, 11400714819323198485",
+                "  ret i64 %mixed",
+                "}",
+                "",
+            ]
+        if normalized == "bool":
+            return [
+                f"define private i64 {_hash_helper_name(normalized)}(i1 %value) {{",
+                "entry:",
+                "  %wide = zext i1 %value to i64",
+                "  %mixed = mul i64 %wide, 11400714819323198485",
+                "  ret i64 %mixed",
+                "}",
+                "",
+            ]
+        if normalized == "str":
+            return [
+                f"define private i64 {_hash_helper_name(normalized)}({STR_LLVM_TYPE} %value) {{",
+                "entry:",
+                f"  %data = extractvalue {STR_LLVM_TYPE} %value, 0",
+                f"  %len = extractvalue {STR_LLVM_TYPE} %value, 1",
+                "  %hash = call i64 @__pyx_hash_bytes_raw(ptr %data, i64 %len)",
+                "  ret i64 %hash",
+                "}",
+                "",
+            ]
+        if normalized == "bytes":
+            return [
+                f"define private i64 {_hash_helper_name(normalized)}({BYTES_LLVM_TYPE} %value) {{",
+                "entry:",
+                f"  %data = extractvalue {BYTES_LLVM_TYPE} %value, 0",
+                f"  %len = extractvalue {BYTES_LLVM_TYPE} %value, 1",
+                "  %hash = call i64 @__pyx_hash_bytes_raw(ptr %data, i64 %len)",
+                "  ret i64 %hash",
+                "}",
+                "",
+            ]
+
+        class_info = self.project.lookup_class(normalized)
+        if class_info is None:
+            raise CompileError(f"type '{normalized}' is not hashable", code=_ERR_UNSUPPORTED_TYPE)
+
+        lines: list[str] = []
+        for field_t in class_info.field_types:
+            lines.extend(self._emit_hash_helper_for_type(field_t, emitted))
+        lines.extend([
+            f"define private i64 {_hash_helper_name(normalized)}({llvm_type(normalized)} %value) {{",
+            "entry:",
+            "  %acc0 = mul i64 1469598103934665603, 1099511628211",
+        ])
+        current = "%acc0"
+        for index, field_t in enumerate(class_info.field_types):
+            field_reg = f"%field{index}"
+            field_hash = f"%field_hash{index}"
+            mixed = f"%acc{index + 1}"
+            lines.append(f"  {field_reg} = extractvalue {llvm_type(normalized)} %value, {index}")
+            lines.append(
+                f"  {field_hash} = call i64 {_hash_helper_name(field_t)}({llvm_type(field_t)} {field_reg})"
+            )
+            lines.append(f"  {mixed} = xor i64 {current}, {field_hash}")
+            current = mixed
+        lines.extend([
+            f"  ret i64 {current}",
+            "}",
+            "",
+        ])
+        return lines
+
+    def _emit_eq_helper_for_type(self, type_name: str, emitted: set[str]) -> list[str]:
+        normalized = normalize_type_name(type_name)
+        if normalized in emitted:
+            return []
+        emitted.add(normalized)
+
+        llvm_ty = llvm_type(normalized)
+        if normalized == "int":
+            return [
+                f"define private i1 {_eq_helper_name(normalized)}(i64 %left, i64 %right) {{",
+                "entry:",
+                "  %eq = icmp eq i64 %left, %right",
+                "  ret i1 %eq",
+                "}",
+                "",
+            ]
+        if normalized == "bool":
+            return [
+                f"define private i1 {_eq_helper_name(normalized)}(i1 %left, i1 %right) {{",
+                "entry:",
+                "  %eq = icmp eq i1 %left, %right",
+                "  ret i1 %eq",
+                "}",
+                "",
+            ]
+        if normalized == "str":
+            return [
+                f"define private i1 {_eq_helper_name(normalized)}({STR_LLVM_TYPE} %left, {STR_LLVM_TYPE} %right) {{",
+                "entry:",
+                f"  %left_data = extractvalue {STR_LLVM_TYPE} %left, 0",
+                f"  %left_len = extractvalue {STR_LLVM_TYPE} %left, 1",
+                f"  %right_data = extractvalue {STR_LLVM_TYPE} %right, 0",
+                f"  %right_len = extractvalue {STR_LLVM_TYPE} %right, 1",
+                "  %eq = call i1 @__pyx_bytes_eq_raw(ptr %left_data, i64 %left_len, ptr %right_data, i64 %right_len)",
+                "  ret i1 %eq",
+                "}",
+                "",
+            ]
+        if normalized == "bytes":
+            return [
+                f"define private i1 {_eq_helper_name(normalized)}({BYTES_LLVM_TYPE} %left, {BYTES_LLVM_TYPE} %right) {{",
+                "entry:",
+                f"  %left_data = extractvalue {BYTES_LLVM_TYPE} %left, 0",
+                f"  %left_len = extractvalue {BYTES_LLVM_TYPE} %left, 1",
+                f"  %right_data = extractvalue {BYTES_LLVM_TYPE} %right, 0",
+                f"  %right_len = extractvalue {BYTES_LLVM_TYPE} %right, 1",
+                "  %eq = call i1 @__pyx_bytes_eq_raw(ptr %left_data, i64 %left_len, ptr %right_data, i64 %right_len)",
+                "  ret i1 %eq",
+                "}",
+                "",
+            ]
+
+        class_info = self.project.lookup_class(normalized)
+        if class_info is None:
+            raise CompileError(f"type '{normalized}' is not hashable", code=_ERR_UNSUPPORTED_TYPE)
+
+        lines: list[str] = []
+        for field_t in class_info.field_types:
+            lines.extend(self._emit_eq_helper_for_type(field_t, emitted))
+        lines.extend([
+            f"define private i1 {_eq_helper_name(normalized)}({llvm_ty} %left, {llvm_ty} %right) {{",
+            "entry:",
+        ])
+        current = "1"
+        for index, field_t in enumerate(class_info.field_types):
+            left_reg = f"%left_field{index}"
+            right_reg = f"%right_field{index}"
+            eq_reg = f"%eq{index}"
+            combined = f"%all{index}"
+            lines.append(f"  {left_reg} = extractvalue {llvm_ty} %left, {index}")
+            lines.append(f"  {right_reg} = extractvalue {llvm_ty} %right, {index}")
+            lines.append(
+                f"  {eq_reg} = call i1 {_eq_helper_name(field_t)}({llvm_type(field_t)} {left_reg}, {llvm_type(field_t)} {right_reg})"
+            )
+            lines.append(f"  {combined} = and i1 {current}, {eq_reg}")
+            current = combined
+        lines.extend([
+            f"  ret i1 {current}",
+            "}",
+            "",
+        ])
+        return lines
+
+    def _emit_single_dict_helpers(self, dict_type: str) -> list[str]:
+        key_t, value_t = parse_dict_type(dict_type)  # type: ignore[misc]
+        entry_ty = _dict_entry_type_name(dict_type)
+        key_llvm = llvm_type(key_t)
+        value_llvm = llvm_type(value_t)
+        insert_raw = _dict_insert_raw_name(dict_type)
+        grow = _dict_grow_name(dict_type)
+        new_fn = _dict_new_name(dict_type)
+        set_fn = _dict_set_name(dict_type)
+        try_get = _dict_try_get_name(dict_type)
+        contains = _dict_contains_name(dict_type)
+        hash_fn = _hash_helper_name(key_t)
+        eq_fn = _eq_helper_name(key_t)
+
+        return [
+            f"define private i1 {insert_raw}(ptr %entries, i64 %cap, {key_llvm} %key, {value_llvm} %value) {{",
+            "entry:",
+            f"  %hash = call i64 {hash_fn}({key_llvm} %key)",
+            "  %start = urem i64 %hash, %cap",
+            "  br label %loop",
+            "loop:",
+            "  %idx = phi i64 [%start, %entry], [%next_idx, %advance]",
+            "  %probes = phi i64 [0, %entry], [%next_probes, %advance]",
+            "  %full = icmp eq i64 %probes, %cap",
+            "  br i1 %full, label %trap, label %check",
+            "check:",
+            f"  %entry_ptr = getelementptr {entry_ty}, ptr %entries, i64 %idx",
+            f"  %occ_ptr = getelementptr {entry_ty}, ptr %entry_ptr, i32 0, i32 0",
+            "  %occupied = load i1, ptr %occ_ptr",
+            "  br i1 %occupied, label %occupied_case, label %empty_case",
+            "empty_case:",
+            "  store i1 1, ptr %occ_ptr",
+            f"  %key_ptr = getelementptr {entry_ty}, ptr %entry_ptr, i32 0, i32 1",
+            f"  store {key_llvm} %key, ptr %key_ptr",
+            f"  %value_ptr = getelementptr {entry_ty}, ptr %entry_ptr, i32 0, i32 2",
+            f"  store {value_llvm} %value, ptr %value_ptr",
+            "  ret i1 1",
+            "occupied_case:",
+            f"  %existing_key_ptr = getelementptr {entry_ty}, ptr %entry_ptr, i32 0, i32 1",
+            f"  %existing_key = load {key_llvm}, ptr %existing_key_ptr",
+            f"  %same_key = call i1 {eq_fn}({key_llvm} %existing_key, {key_llvm} %key)",
+            "  br i1 %same_key, label %overwrite, label %advance",
+            "overwrite:",
+            f"  %overwrite_value_ptr = getelementptr {entry_ty}, ptr %entry_ptr, i32 0, i32 2",
+            f"  store {value_llvm} %value, ptr %overwrite_value_ptr",
+            "  ret i1 0",
+            "advance:",
+            "  %idx_plus = add i64 %idx, 1",
+            "  %wrap = icmp eq i64 %idx_plus, %cap",
+            "  %next_idx = select i1 %wrap, i64 0, i64 %idx_plus",
+            "  %next_probes = add i64 %probes, 1",
+            "  br label %loop",
+            "trap:",
+            "  call void @abort()",
+            "  unreachable",
+            "}",
+            "",
+            f"define private {DICT_LLVM_TYPE} {grow}({DICT_LLVM_TYPE} %dict) {{",
+            "entry:",
+            f"  %old_entries = extractvalue {DICT_LLVM_TYPE} %dict, 0",
+            f"  %old_size = extractvalue {DICT_LLVM_TYPE} %dict, 1",
+            f"  %old_cap = extractvalue {DICT_LLVM_TYPE} %dict, 2",
+            "  %is_zero = icmp eq i64 %old_cap, 0",
+            "  %doubled = mul i64 %old_cap, 2",
+            "  %new_cap = select i1 %is_zero, i64 8, i64 %doubled",
+            f"  %entry_size_ptr = getelementptr {entry_ty}, ptr null, i32 1",
+            "  %entry_size = ptrtoint ptr %entry_size_ptr to i64",
+            "  %bytes = mul i64 %new_cap, %entry_size",
+            "  %new_entries = call ptr @__pyx_alloc_zeroed(i64 %bytes)",
+            "  br label %loop",
+            "loop:",
+            "  %i = phi i64 [0, %entry], [%next_i, %advance_loop]",
+            "  %done = icmp eq i64 %i, %old_cap",
+            "  br i1 %done, label %exit, label %body",
+            "body:",
+            f"  %old_entry_ptr = getelementptr {entry_ty}, ptr %old_entries, i64 %i",
+            f"  %old_occ_ptr = getelementptr {entry_ty}, ptr %old_entry_ptr, i32 0, i32 0",
+            "  %old_occ = load i1, ptr %old_occ_ptr",
+            "  br i1 %old_occ, label %reinsert, label %advance_loop",
+            "reinsert:",
+            f"  %old_key_ptr = getelementptr {entry_ty}, ptr %old_entry_ptr, i32 0, i32 1",
+            f"  %old_key = load {key_llvm}, ptr %old_key_ptr",
+            f"  %old_value_ptr = getelementptr {entry_ty}, ptr %old_entry_ptr, i32 0, i32 2",
+            f"  %old_value = load {value_llvm}, ptr %old_value_ptr",
+            f"  %ignored = call i1 {insert_raw}(ptr %new_entries, i64 %new_cap, {key_llvm} %old_key, {value_llvm} %old_value)",
+            "  br label %advance_loop",
+            "advance_loop:",
+            "  %next_i = add i64 %i, 1",
+            "  br label %loop",
+            "exit:",
+            f"  %d0 = insertvalue {DICT_LLVM_TYPE} undef, ptr %new_entries, 0",
+            f"  %d1 = insertvalue {DICT_LLVM_TYPE} %d0, i64 %old_size, 1",
+            f"  %d2 = insertvalue {DICT_LLVM_TYPE} %d1, i64 %new_cap, 2",
+            f"  ret {DICT_LLVM_TYPE} %d2",
+            "}",
+            "",
+            f"define private {DICT_LLVM_TYPE} {new_fn}() {{",
+            "entry:",
+            f"  %entry_size_ptr = getelementptr {entry_ty}, ptr null, i32 1",
+            "  %entry_size = ptrtoint ptr %entry_size_ptr to i64",
+            "  %bytes = mul i64 8, %entry_size",
+            "  %entries = call ptr @__pyx_alloc_zeroed(i64 %bytes)",
+            f"  %d0 = insertvalue {DICT_LLVM_TYPE} undef, ptr %entries, 0",
+            f"  %d1 = insertvalue {DICT_LLVM_TYPE} %d0, i64 0, 1",
+            f"  %d2 = insertvalue {DICT_LLVM_TYPE} %d1, i64 8, 2",
+            f"  ret {DICT_LLVM_TYPE} %d2",
+            "}",
+            "",
+            f"define private {DICT_LLVM_TYPE} {set_fn}({DICT_LLVM_TYPE} %dict, {key_llvm} %key, {value_llvm} %value) {{",
+            "entry:",
+            f"  %size = extractvalue {DICT_LLVM_TYPE} %dict, 1",
+            f"  %cap = extractvalue {DICT_LLVM_TYPE} %dict, 2",
+            "  %scaled_size = mul i64 %size, 10",
+            "  %scaled_cap = mul i64 %cap, 7",
+            "  %need_grow = icmp sge i64 %scaled_size, %scaled_cap",
+            "  br i1 %need_grow, label %grow_case, label %ready",
+            "grow_case:",
+            f"  %grown = call {DICT_LLVM_TYPE} {grow}({DICT_LLVM_TYPE} %dict)",
+            "  br label %ready",
+            "ready:",
+            f"  %dict_ready = phi {DICT_LLVM_TYPE} [%dict, %entry], [%grown, %grow_case]",
+            f"  %entries = extractvalue {DICT_LLVM_TYPE} %dict_ready, 0",
+            f"  %size_ready = extractvalue {DICT_LLVM_TYPE} %dict_ready, 1",
+            f"  %cap_ready = extractvalue {DICT_LLVM_TYPE} %dict_ready, 2",
+            f"  %inserted = call i1 {insert_raw}(ptr %entries, i64 %cap_ready, {key_llvm} %key, {value_llvm} %value)",
+            "  %inserted_i64 = zext i1 %inserted to i64",
+            "  %new_size = add i64 %size_ready, %inserted_i64",
+            f"  %out0 = insertvalue {DICT_LLVM_TYPE} undef, ptr %entries, 0",
+            f"  %out1 = insertvalue {DICT_LLVM_TYPE} %out0, i64 %new_size, 1",
+            f"  %out2 = insertvalue {DICT_LLVM_TYPE} %out1, i64 %cap_ready, 2",
+            f"  ret {DICT_LLVM_TYPE} %out2",
+            "}",
+            "",
+            f"define private i1 {try_get}({DICT_LLVM_TYPE} %dict, {key_llvm} %key, ptr %out) {{",
+            "entry:",
+            f"  %entries = extractvalue {DICT_LLVM_TYPE} %dict, 0",
+            f"  %cap = extractvalue {DICT_LLVM_TYPE} %dict, 2",
+            "  %cap_zero = icmp eq i64 %cap, 0",
+            "  br i1 %cap_zero, label %ret_false, label %start",
+            "start:",
+            f"  %hash = call i64 {hash_fn}({key_llvm} %key)",
+            "  %idx0 = urem i64 %hash, %cap",
+            "  br label %loop",
+            "loop:",
+            "  %idx = phi i64 [%idx0, %start], [%next_idx, %advance]",
+            "  %probes = phi i64 [0, %start], [%next_probes, %advance]",
+            "  %done = icmp eq i64 %probes, %cap",
+            "  br i1 %done, label %ret_false, label %check",
+            "check:",
+            f"  %entry_ptr = getelementptr {entry_ty}, ptr %entries, i64 %idx",
+            f"  %occ_ptr = getelementptr {entry_ty}, ptr %entry_ptr, i32 0, i32 0",
+            "  %occupied = load i1, ptr %occ_ptr",
+            "  br i1 %occupied, label %occupied_case, label %ret_false",
+            "occupied_case:",
+            f"  %key_ptr = getelementptr {entry_ty}, ptr %entry_ptr, i32 0, i32 1",
+            f"  %existing_key = load {key_llvm}, ptr %key_ptr",
+            f"  %same_key = call i1 {eq_fn}({key_llvm} %existing_key, {key_llvm} %key)",
+            "  br i1 %same_key, label %found, label %advance",
+            "found:",
+            f"  %value_ptr = getelementptr {entry_ty}, ptr %entry_ptr, i32 0, i32 2",
+            f"  %loaded_value = load {value_llvm}, ptr %value_ptr",
+            f"  store {value_llvm} %loaded_value, ptr %out",
+            "  ret i1 1",
+            "advance:",
+            "  %idx_plus = add i64 %idx, 1",
+            "  %wrap = icmp eq i64 %idx_plus, %cap",
+            "  %next_idx = select i1 %wrap, i64 0, i64 %idx_plus",
+            "  %next_probes = add i64 %probes, 1",
+            "  br label %loop",
+            "ret_false:",
+            "  ret i1 0",
+            "}",
+            "",
+            f"define private i1 {contains}({DICT_LLVM_TYPE} %dict, {key_llvm} %key) {{",
+            "entry:",
+            f"  %tmp = alloca {value_llvm}",
+            f"  %ok = call i1 {try_get}({DICT_LLVM_TYPE} %dict, {key_llvm} %key, ptr %tmp)",
+            "  ret i1 %ok",
             "}",
             "",
         ]
@@ -498,7 +1006,7 @@ class _FunctionCompiler:
             if isinstance(stmt, ast.Return):
                 if stmt.value is None:
                     raise CompileError("void return is not supported", code=_ERR_UNSUPPORTED_STATEMENT, line=stmt.lineno, col=stmt.col_offset)
-                value, ty = self._compile_expr(stmt.value)
+                value, ty = self._compile_value_for_expected(stmt.value, expected_ret)
                 coerced, _ = self._coerce_value(value, ty, expected_ret, stmt, "return type mismatch")
                 self.body_lines.append(f"  ret {llvm_type(expected_ret)} {coerced}")
                 return True
@@ -506,8 +1014,9 @@ class _FunctionCompiler:
             if isinstance(stmt, ast.Assign):
                 if len(stmt.targets) != 1:
                     raise CompileError("only single-target assignment is supported", code=_ERR_UNSUPPORTED_STATEMENT, line=stmt.lineno, col=stmt.col_offset)
-                value, ty = self._compile_expr(stmt.value)
-                self._assign_target(stmt.targets[0], value, ty, stmt)
+                target = stmt.targets[0]
+                value, ty = self._compile_value_for_target(stmt.value, target)
+                self._assign_target(target, value, ty, stmt)
                 continue
 
             if isinstance(stmt, ast.AnnAssign):
@@ -517,29 +1026,9 @@ class _FunctionCompiler:
                 self._ensure_supported_type(annotated, stmt)
                 self._ensure_slot(stmt.target.id, annotated)
                 if stmt.value is not None:
-                    value, ty = self._compile_expr(stmt.value)
+                    value, ty = self._compile_value_for_expected(stmt.value, annotated)
                     coerced, _ = self._coerce_value(value, ty, annotated, stmt, f"assignment type mismatch for '{stmt.target.id}'")
                     self.body_lines.append(f"  store {llvm_type(annotated)} {coerced}, ptr %{stmt.target.id}.slot")
-                continue
-
-            if isinstance(stmt, ast.AnnAssign):
-                if not isinstance(stmt.target, ast.Name):
-                    raise CompileError(
-                        "only simple name annotation is supported",
-                        code=_ERR_UNSUPPORTED_STATEMENT,
-                        line=stmt.lineno,
-                        col=stmt.col_offset,
-                    )
-                name = stmt.target.id
-                ann_ty = self._annotation_to_type(stmt.annotation, stmt, f"annotated variable '{name}'")
-                if stmt.value is not None:
-                    value, value_ty = self._compile_expr(stmt.value)
-                    if name not in self.slot_types:
-                        self._ensure_slot(name, ann_ty)
-                    coerced, _ = self._coerce_value(value, value_ty, self.slot_types[name], stmt, f"annotated assignment type mismatch for '{name}'")
-                    self.body_lines.append(f"  store {llvm_type(self.slot_types[name])} {coerced}, ptr %{name}.slot")
-                else:
-                    self._ensure_slot(name, ann_ty)
                 continue
 
             if isinstance(stmt, ast.If):
@@ -633,12 +1122,12 @@ class _FunctionCompiler:
             return
 
         if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-            list_name = target.value.id
-            list_t = self.slot_types.get(list_name)
-            item_t = None if list_t is None else parse_list_type(list_t)
+            container_name = target.value.id
+            container_t = self.slot_types.get(container_name)
+            item_t = None if container_t is None else parse_list_type(container_t)
             if item_t is not None:
                 list_val = self._new_reg()
-                self.body_lines.append(f"  {list_val} = load {LIST_LLVM_TYPE}, ptr %{list_name}.slot")
+                self.body_lines.append(f"  {list_val} = load {LIST_LLVM_TYPE}, ptr %{container_name}.slot")
                 data_ptr, length, _ = self._extract_list_parts(list_val)
                 index, index_t = self._compile_expr(target.slice)
                 self._require_assignable(index_t, "int", target, "list assignment index must be int")
@@ -647,6 +1136,21 @@ class _FunctionCompiler:
                 elem_ptr = self._new_reg()
                 self.body_lines.append(f"  {elem_ptr} = getelementptr {llvm_type(item_t)}, ptr {data_ptr}, i64 {index}")
                 self.body_lines.append(f"  store {llvm_type(item_t)} {coerced}, ptr {elem_ptr}")
+                return
+            dict_types = None if container_t is None else parse_dict_type(container_t)
+            if dict_types is not None:
+                key_t, value_t = dict_types
+                self.ctx.register_dict_type(container_t)
+                dict_val = self._new_reg()
+                self.body_lines.append(f"  {dict_val} = load {DICT_LLVM_TYPE}, ptr %{container_name}.slot")
+                key_val, key_got_t = self._compile_expr(target.slice)
+                coerced_key, _ = self._coerce_value(key_val, key_got_t, key_t, target, "dict assignment key type mismatch")
+                coerced_value, _ = self._coerce_value(value, ty, value_t, node, "dict assignment value type mismatch")
+                updated = self._new_reg()
+                self.body_lines.append(
+                    f"  {updated} = call {DICT_LLVM_TYPE} {_dict_set_name(container_t)}({DICT_LLVM_TYPE} {dict_val}, {llvm_type(key_t)} {coerced_key}, {llvm_type(value_t)} {coerced_value})"
+                )
+                self.body_lines.append(f"  store {DICT_LLVM_TYPE} {updated}, ptr %{container_name}.slot")
                 return
 
         raise CompileError("unsupported assignment target", code=_ERR_UNSUPPORTED_STATEMENT, line=node.lineno, col=node.col_offset)
@@ -740,12 +1244,7 @@ class _FunctionCompiler:
             )
 
         if isinstance(node, ast.Dict):
-            raise CompileError(
-                "type 'dict[K,V]' is planned but not lowered in LLVM mode yet",
-                code=_ERR_UNSUPPORTED_TYPE,
-                line=node.lineno,
-                col=node.col_offset,
-            )
+            return self._compile_dict_literal(node)
 
         if isinstance(node, ast.Attribute):
             owner, owner_t = self._compile_expr(node.value)
@@ -780,6 +1279,21 @@ class _FunctionCompiler:
             left, left_t = self._compile_expr(node.left)
             right, right_t = self._compile_expr(node.comparators[0])
             op = node.ops[0]
+
+            dict_types = parse_dict_type(right_t)
+            if dict_types is not None and isinstance(op, (ast.In, ast.NotIn)):
+                key_t, _ = dict_types
+                self.ctx.register_dict_type(right_t)
+                coerced_left, _ = self._coerce_value(left, left_t, key_t, node.left, "dict membership key type mismatch")
+                contains_reg = self._new_reg()
+                self.body_lines.append(
+                    f"  {contains_reg} = call i1 {_dict_contains_name(right_t)}({DICT_LLVM_TYPE} {right}, {llvm_type(key_t)} {coerced_left})"
+                )
+                if isinstance(op, ast.In):
+                    return contains_reg, "bool"
+                inverted = self._new_reg()
+                self.body_lines.append(f"  {inverted} = xor i1 {contains_reg}, 1")
+                return inverted, "bool"
 
             if left_t == "bool" and right_t == "bool" and isinstance(op, (ast.Eq, ast.NotEq)):
                 pred = "eq" if isinstance(op, ast.Eq) else "ne"
@@ -821,6 +1335,10 @@ class _FunctionCompiler:
                 return byte_length, "int"
             if parse_list_type(value_t) is not None:
                 _, length, _ = self._extract_list_parts(value)
+                return length, "int"
+            if parse_dict_type(value_t) is not None:
+                length = self._new_reg()
+                self.body_lines.append(f"  {length} = extractvalue {DICT_LLVM_TYPE} {value}, 1")
                 return length, "int"
             raise CompileError(f"len() does not support '{value_t}' in LLVM mode", code=_ERR_UNSUPPORTED_EXPRESSION, line=node.lineno, col=node.col_offset)
 
@@ -878,6 +1396,10 @@ class _FunctionCompiler:
             if owner_t in FILE_TYPES:
                 return self._compile_file_method(owner_val, owner_t, node.func.attr, node)
 
+            dict_types = parse_dict_type(owner_t)
+            if dict_types is not None and node.func.attr == "get":
+                return self._compile_dict_get(owner_val, owner_t, node)
+
             class_info = self.project.lookup_class(owner_t)
             if class_info is not None and node.func.attr in class_info.methods:
                 signature = class_info.methods[node.func.attr]
@@ -921,11 +1443,10 @@ class _FunctionCompiler:
 
     def _compile_subscript(self, node: ast.Subscript) -> tuple[str, str]:
         container, container_t = self._compile_expr(node.value)
-        index, index_t = self._compile_expr(node.slice)
-        self._require_assignable(index_t, "int", node, "index must be int")
-
         item_t = parse_list_type(container_t)
         if item_t is not None:
+            index, index_t = self._compile_expr(node.slice)
+            self._require_assignable(index_t, "int", node, "index must be int")
             data_ptr, length, _ = self._extract_list_parts(container)
             self._emit_bounds_check(index, length, "list_index")
             elem_ptr = self._new_reg()
@@ -934,7 +1455,32 @@ class _FunctionCompiler:
             self.body_lines.append(f"  {elem_val} = load {llvm_type(item_t)}, ptr {elem_ptr}")
             return elem_val, item_t
 
+        dict_types = parse_dict_type(container_t)
+        if dict_types is not None:
+            key_t, value_t = dict_types
+            self.ctx.register_dict_type(container_t)
+            index, index_t = self._compile_expr(node.slice)
+            coerced_index, _ = self._coerce_value(index, index_t, key_t, node.slice, "dict subscript key type mismatch")
+            out_ptr = self._new_reg()
+            found = self._new_reg()
+            ok_label = self._new_label("dict_get_ok")
+            trap_label = self._new_label("dict_get_trap")
+            self.entry_lines.append(f"  {out_ptr} = alloca {llvm_type(value_t)}")
+            self.body_lines.append(
+                f"  {found} = call i1 {_dict_try_get_name(container_t)}({DICT_LLVM_TYPE} {container}, {llvm_type(key_t)} {coerced_index}, ptr {out_ptr})"
+            )
+            self.body_lines.append(f"  br i1 {found}, label %{ok_label}, label %{trap_label}")
+            self.body_lines.append(f"{trap_label}:")
+            self.body_lines.append("  call void @abort()")
+            self.body_lines.append("  unreachable")
+            self.body_lines.append(f"{ok_label}:")
+            loaded = self._new_reg()
+            self.body_lines.append(f"  {loaded} = load {llvm_type(value_t)}, ptr {out_ptr}")
+            return loaded, value_t
+
         if container_t == "str":
+            index, index_t = self._compile_expr(node.slice)
+            self._require_assignable(index_t, "int", node, "index must be int")
             self.ctx.uses_utf8_helpers = True
             data_ptr, byte_length = self._extract_str_parts(container)
             reg = self._new_reg()
@@ -1694,13 +2240,175 @@ class _FunctionCompiler:
         self.body_lines.append(f"  {capacity} = extractvalue {LIST_LLVM_TYPE} {value}, 2")
         return data_ptr, length, capacity
 
+    def _compile_value_for_expected(self, node: ast.AST, expected_t: str) -> tuple[str, str]:
+        dict_types = parse_dict_type(expected_t)
+        if isinstance(node, ast.Dict) and dict_types is not None:
+            return self._compile_dict_literal(node, expected_t)
+        return self._compile_expr(node)
+
+    def _compile_value_for_target(self, node: ast.AST, target: ast.expr) -> tuple[str, str]:
+        expected_t = self._target_expected_type(target)
+        if expected_t is not None:
+            return self._compile_value_for_expected(node, expected_t)
+        return self._compile_expr(node)
+
+    def _target_expected_type(self, target: ast.expr) -> str | None:
+        if isinstance(target, ast.Name):
+            return self.slot_types.get(target.id)
+
+        if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+            owner_t = self.slot_types.get(target.value.id)
+            if owner_t is None:
+                return None
+            class_info = self.project.lookup_class(owner_t)
+            if class_info is None:
+                return None
+            field_index = class_info.field_names.index(target.attr) if target.attr in class_info.field_names else -1
+            if field_index < 0:
+                return None
+            return class_info.field_types[field_index]
+
+        if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+            container_t = self.slot_types.get(target.value.id)
+            if container_t is None:
+                return None
+            list_item = parse_list_type(container_t)
+            if list_item is not None:
+                return list_item
+            dict_types = parse_dict_type(container_t)
+            if dict_types is not None:
+                _, value_t = dict_types
+                return value_t
+
+        return None
+
+    def _compile_dict_literal(self, node: ast.Dict, expected_t: str | None = None) -> tuple[str, str]:
+        compiled_items: list[tuple[str, str, str, str]] = []
+        for key_node, value_node in zip(node.keys, node.values, strict=True):
+            if key_node is None:
+                raise CompileError(
+                    "dict unpacking is not supported in LLVM mode",
+                    code=_ERR_UNSUPPORTED_EXPRESSION,
+                    line=node.lineno,
+                    col=node.col_offset,
+                )
+            key_val, key_t = self._compile_expr(key_node)
+            value_val, value_t = self._compile_expr(value_node)
+            compiled_items.append((key_val, key_t, value_val, value_t))
+
+        if expected_t is not None:
+            normalized_expected = normalize_type_name(expected_t)
+            if parse_dict_type(normalized_expected) is not None:
+                dict_t = normalized_expected
+            else:
+                raise CompileError(
+                    f"dict literal cannot be assigned to '{expected_t}'",
+                    code=_ERR_TYPE_MISMATCH,
+                    line=node.lineno,
+                    col=node.col_offset,
+                )
+        else:
+            if not compiled_items:
+                raise CompileError(
+                    "empty dict literal requires explicit dict type context",
+                    code=_ERR_UNSUPPORTED_EXPRESSION,
+                    line=node.lineno,
+                    col=node.col_offset,
+                )
+            key_t = compiled_items[0][1]
+            value_t = compiled_items[0][3]
+            for _, item_key_t, _, item_value_t in compiled_items[1:]:
+                key_t = self._merge_item_type(key_t, item_key_t)
+                value_t = self._merge_item_type(value_t, item_value_t)
+            dict_t = f"dict[{key_t},{value_t}]"
+
+        self._ensure_supported_type(dict_t, node)
+        self.ctx.register_dict_type(dict_t)
+        current = self._new_reg()
+        self.body_lines.append(f"  {current} = call {DICT_LLVM_TYPE} {_dict_new_name(dict_t)}()")
+        key_t, value_t = parse_dict_type(dict_t)  # type: ignore[misc]
+        for idx, (key_val, key_got_t, val_val, val_got_t) in enumerate(compiled_items):
+            key_node = node.keys[idx]
+            value_node = node.values[idx]
+            assert key_node is not None
+            coerced_key, _ = self._coerce_value(key_val, key_got_t, key_t, key_node, "dict literal key type mismatch")
+            coerced_value, _ = self._coerce_value(val_val, val_got_t, value_t, value_node, "dict literal value type mismatch")
+            updated = self._new_reg()
+            self.body_lines.append(
+                f"  {updated} = call {DICT_LLVM_TYPE} {_dict_set_name(dict_t)}({DICT_LLVM_TYPE} {current}, {llvm_type(key_t)} {coerced_key}, {llvm_type(value_t)} {coerced_value})"
+            )
+            current = updated
+        return current, dict_t
+
+    def _compile_dict_get(self, owner_val: str, owner_t: str, node: ast.Call) -> tuple[str, str]:
+        dict_types = parse_dict_type(owner_t)
+        assert dict_types is not None
+        if len(node.args) != 2:
+            raise CompileError(
+                "dict.get() expects exactly 2 arguments in LLVM mode",
+                code=_ERR_CALL_ARG_COUNT,
+                line=node.lineno,
+                col=node.col_offset,
+            )
+        key_t, value_t = dict_types
+        self.ctx.register_dict_type(owner_t)
+        key_val, key_got_t = self._compile_expr(node.args[0])
+        coerced_key, _ = self._coerce_value(key_val, key_got_t, key_t, node.args[0], "dict.get() key type mismatch")
+        default_val, default_t = self._compile_expr(node.args[1])
+        coerced_default, _ = self._coerce_value(default_val, default_t, value_t, node.args[1], "dict.get() default type mismatch")
+        out_ptr = self._new_reg()
+        found = self._new_reg()
+        found_label = self._new_label("dict_get_found")
+        miss_label = self._new_label("dict_get_miss")
+        merge_label = self._new_label("dict_get_merge")
+        self.entry_lines.append(f"  {out_ptr} = alloca {llvm_type(value_t)}")
+        self.body_lines.append(
+            f"  {found} = call i1 {_dict_try_get_name(owner_t)}({DICT_LLVM_TYPE} {owner_val}, {llvm_type(key_t)} {coerced_key}, ptr {out_ptr})"
+        )
+        self.body_lines.append(f"  br i1 {found}, label %{found_label}, label %{miss_label}")
+        self.body_lines.append(f"{found_label}:")
+        loaded = self._new_reg()
+        self.body_lines.append(f"  {loaded} = load {llvm_type(value_t)}, ptr {out_ptr}")
+        self.body_lines.append(f"  br label %{merge_label}")
+        self.body_lines.append(f"{miss_label}:")
+        self.body_lines.append(f"  br label %{merge_label}")
+        self.body_lines.append(f"{merge_label}:")
+        result = self._new_reg()
+        self.body_lines.append(
+            f"  {result} = phi {llvm_type(value_t)} [{loaded}, %{found_label}], [{coerced_default}, %{miss_label}]"
+        )
+        return result, value_t
+
     def _render_annotation(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Name) and node.id in self.module.classes:
+            return self.module.classes[node.id][1].qualified_name
+        if isinstance(node, ast.Name):
+            if node.id in {"int", "float", "bool", "str", "bytes"}:
+                return node.id
+            imported = self.module.imported_symbols.get(node.id)
+            if imported is not None:
+                target_module = self.project.lookup_module(imported.module_name)
+                if target_module is not None and imported.symbol_name in target_module.classes:
+                    return target_module.classes[imported.symbol_name][1].qualified_name
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            imported_module = self.module.imported_modules.get(node.value.id)
+            if imported_module is not None:
+                target_module = self.project.lookup_module(imported_module.module_name)
+                if target_module is not None and node.attr in target_module.classes:
+                    return target_module.classes[node.attr][1].qualified_name
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name) and node.value.id in {"list", "set"}:
+                inner = self._render_annotation(node.slice)
+                return f"{node.value.id}[{inner}]"
+            if isinstance(node.value, ast.Name) and node.value.id == "dict":
+                if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 2:
+                    key_t = self._render_annotation(node.slice.elts[0])
+                    value_t = self._render_annotation(node.slice.elts[1])
+                    return f"dict[{key_t},{value_t}]"
         rendered = ast.unparse(node)
         compact = rendered.replace(" ", "")
         if compact in {"int|float", "float|int"}:
             return NUMERIC_UNION
-        if isinstance(node, ast.Name) and node.id in self.module.classes:
-            return self.module.classes[node.id][1].qualified_name
         return normalize_type_name(rendered)
 
     def _ensure_slot(self, name: str, ty: str) -> None:
@@ -1712,8 +2420,39 @@ class _FunctionCompiler:
     def _ensure_supported_type(self, ty: str, node: ast.AST) -> None:
         if not is_supported_type(ty, self.project.known_type_names()):
             raise CompileError(f"type '{ty}' is not supported", code=_ERR_UNSUPPORTED_TYPE, line=node.lineno, col=node.col_offset)
-        if parse_dict_type(ty) is not None or parse_set_type(ty) is not None:
+        dict_types = parse_dict_type(ty)
+        if dict_types is not None:
+            key_t, _ = dict_types
+            self.ctx.register_dict_type(ty)
+            if not self._is_hashable_type(key_t):
+                raise CompileError(
+                    f"dict key type '{key_t}' is not hashable in LLVM mode",
+                    code=_ERR_UNSUPPORTED_TYPE,
+                    line=node.lineno,
+                    col=node.col_offset,
+                )
+            return
+        if parse_set_type(ty) is not None:
             raise CompileError(f"type '{ty}' is planned but not lowered in LLVM mode yet", code=_ERR_UNSUPPORTED_TYPE, line=node.lineno, col=node.col_offset)
+
+    def _is_hashable_type(self, ty: str, seen: set[str] | None = None) -> bool:
+        normalized = normalize_type_name(ty)
+        if normalized in {"int", "bool", "str", "bytes"}:
+            return True
+        if parse_list_type(normalized) is not None or parse_set_type(normalized) is not None or parse_dict_type(normalized) is not None:
+            return False
+        if normalized in {"float", "Any"} or is_union_type(normalized):
+            return False
+        class_info = self.project.lookup_class(normalized)
+        if class_info is None:
+            return False
+        if seen is None:
+            seen = set()
+        if normalized in seen:
+            return False
+        next_seen = set(seen)
+        next_seen.add(normalized)
+        return all(self._is_hashable_type(field_t, next_seen) for field_t in class_info.field_types)
 
     def _emit_bounds_check(self, index: str, length: str, prefix: str) -> None:
         self.ctx.uses_abort = True

@@ -4,7 +4,14 @@ import ast
 from dataclasses import dataclass
 from pathlib import Path
 
-from .project import ClassInfo, FunctionSignature, ModuleInfo, ProjectInfo, ProjectLoadError, load_project
+from .project import (
+    ClassInfo,
+    FunctionSignature,
+    ModuleInfo,
+    ProjectInfo,
+    ProjectLoadError,
+    load_project,
+)
 from .type_system import (
     BIN_FILE_TYPE,
     CDLL_TYPE,
@@ -106,9 +113,10 @@ class Analyzer:
                 field_t = class_info.fields[stmt.target.id]
                 if not is_supported_type(field_t, self.project.known_type_names()):
                     self._error(stmt, _ERR_UNKNOWN_TYPE, f"Unknown field type '{field_t}' in class '{class_info.name}'")
+                self._validate_dict_type(field_t, stmt)
                 if stmt.value is not None:
                     inferred = self._infer_expr_type(stmt.value, _FunctionContext(module, FunctionSignature(module.name, "__class_init__", (), (), "None"), {}))
-                    if not can_assign_type(inferred, field_t):
+                    if not self._can_assign_expr_type(stmt.value, inferred, field_t):
                         self._error(
                             stmt,
                             _ERR_ANNOTATED_ASSIGN,
@@ -136,12 +144,14 @@ class Analyzer:
                 rendered = signature.arg_types[index]
                 if not is_supported_type(rendered, known_types):
                     self._error(arg, _ERR_UNKNOWN_TYPE, f"Unknown parameter type '{rendered}'")
+                self._validate_dict_type(rendered, arg)
                 local_types[arg.arg] = rendered
 
         if node.returns is None:
             self._error(node, _ERR_RETURN_ANNOTATION, f"Function '{node.name}' requires return annotation")
         elif not is_supported_type(signature.return_type, known_types):
             self._error(node, _ERR_UNKNOWN_TYPE, f"Unknown return type '{signature.return_type}'")
+        self._validate_dict_type(signature.return_type, node)
 
         ctx = _FunctionContext(module=module, signature=signature, locals=local_types)
         self._check_block(node.body, ctx)
@@ -154,14 +164,14 @@ class Analyzer:
         if isinstance(stmt, ast.Return):
             got = self._infer_expr_type(stmt.value, ctx) if stmt.value is not None else "None"
             expected = ctx.signature.return_type
-            if expected != "Any" and got != "Any" and not can_assign_type(got, expected):
+            if expected != "Any" and got != "Any" and not self._can_assign_expr_type(stmt.value, got, expected):
                 self._error(stmt, _ERR_RETURN_MISMATCH, f"Return type mismatch: expected {expected}, got {got}")
             return
 
         if isinstance(stmt, ast.Assign):
             inferred = self._infer_expr_type(stmt.value, ctx)
             for target in stmt.targets:
-                self._assign_target(target, inferred, ctx, stmt)
+                self._assign_target(target, stmt.value, inferred, ctx, stmt)
             return
 
         if isinstance(stmt, ast.AnnAssign):
@@ -171,9 +181,10 @@ class Analyzer:
             annotated = self._render_annotation(stmt.annotation, ctx.module)
             if not is_supported_type(annotated, self.project.known_type_names()):
                 self._error(stmt, _ERR_UNKNOWN_TYPE, f"Unknown annotation '{annotated}'")
+            self._validate_dict_type(annotated, stmt)
             if stmt.value is not None:
                 inferred = self._infer_expr_type(stmt.value, ctx)
-                if not can_assign_type(inferred, annotated):
+                if not self._can_assign_expr_type(stmt.value, inferred, annotated):
                     self._error(
                         stmt,
                         _ERR_ANNOTATED_ASSIGN,
@@ -235,11 +246,18 @@ class Analyzer:
                 merged[name] = then_t
         return merged
 
-    def _assign_target(self, target: ast.expr, inferred: str, ctx: _FunctionContext, node: ast.AST) -> None:
+    def _assign_target(
+        self,
+        target: ast.expr,
+        value_node: ast.AST,
+        inferred: str,
+        ctx: _FunctionContext,
+        node: ast.AST,
+    ) -> None:
         if isinstance(target, ast.Name):
             name = target.id
             current = ctx.locals.get(name)
-            if current is not None and not can_assign_type(inferred, current):
+            if current is not None and not self._can_assign_expr_type(value_node, inferred, current):
                 self._error(
                     node,
                     _ERR_VARIABLE_TYPE_CHANGE,
@@ -259,7 +277,7 @@ class Analyzer:
             if field_t is None:
                 self._error(target, _ERR_UNKNOWN_FIELD, f"Class '{class_info.name}' has no field '{target.attr}'")
                 return
-            if not can_assign_type(inferred, field_t):
+            if not self._can_assign_expr_type(value_node, inferred, field_t):
                 self._error(target, _ERR_CALL_ARG_TYPE, f"Field '{target.attr}' expects {field_t}, got {inferred}")
             return
 
@@ -270,7 +288,7 @@ class Analyzer:
                 index_t = self._infer_expr_type(target.slice, ctx)
                 if index_t != "int":
                     self._error(target.slice, _ERR_CALL_ARG_TYPE, f"List index expects int, got {index_t}")
-                if not can_assign_type(inferred, list_item):
+                if not self._can_assign_expr_type(value_node, inferred, list_item):
                     self._error(target, _ERR_CALL_ARG_TYPE, f"List item expects {list_item}, got {inferred}")
                 return
             dict_types = parse_dict_type(container_t)
@@ -279,7 +297,7 @@ class Analyzer:
                 got_key = self._infer_expr_type(target.slice, ctx)
                 if not can_assign_type(got_key, key_t):
                     self._error(target.slice, _ERR_CALL_ARG_TYPE, f"Dict key expects {key_t}, got {got_key}")
-                if not can_assign_type(inferred, value_t):
+                if not self._can_assign_expr_type(value_node, inferred, value_t):
                     self._error(target, _ERR_CALL_ARG_TYPE, f"Dict value expects {value_t}, got {inferred}")
                 return
 
@@ -350,6 +368,8 @@ class Analyzer:
             for key_node, value_node in zip(node.keys[1:], node.values[1:], strict=True):
                 key_t = self._merge_collection_item_type(key_t, self._infer_expr_type(key_node, ctx))
                 value_t = self._merge_collection_item_type(value_t, self._infer_expr_type(value_node, ctx))
+            if not self._is_hashable_type(key_t):
+                self._error(node, _ERR_UNSUPPORTED, f"Dict key type '{key_t}' is not hashable")
             return f"dict[{key_t},{value_t}]"
 
         if isinstance(node, ast.UnaryOp):
@@ -423,6 +443,13 @@ class Analyzer:
         if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
             left = self._infer_expr_type(node.left, ctx)
             right = self._infer_expr_type(node.comparators[0], ctx)
+            op = node.ops[0]
+            dict_types = parse_dict_type(right)
+            if dict_types is not None and isinstance(op, (ast.In, ast.NotIn)):
+                key_t, _ = dict_types
+                if not can_assign_type(left, key_t):
+                    self._error(node.left, _ERR_CALL_ARG_TYPE, f"Dict membership expects {key_t}, got {left}")
+                return "bool"
             if left == right or (is_numeric_type(left) and is_numeric_type(right)):
                 return "bool"
             return "Any"
@@ -490,7 +517,7 @@ class Analyzer:
             )
         for index, (arg_node, expected_t) in enumerate(zip(node.args, target.arg_types), start=1):
             got_t = self._infer_expr_type(arg_node, ctx)
-            if not can_assign_type(got_t, expected_t):
+            if not self._can_assign_expr_type(arg_node, got_t, expected_t):
                 self._error(
                     arg_node,
                     _ERR_CALL_ARG_TYPE,
@@ -547,6 +574,10 @@ class Analyzer:
             list_item = parse_list_type(owner_t)
             if list_item is not None and func.attr == "append":
                 return _CallableTarget((list_item,), "None", f"{owner_t}.append")
+            dict_types = parse_dict_type(owner_t)
+            if dict_types is not None and func.attr == "get":
+                key_t, value_t = dict_types
+                return _CallableTarget((key_t, value_t), value_t, f"{owner_t}.get")
 
             if owner_t in FILE_TYPES:
                 return self._resolve_file_method(owner_t, func.attr, func)
@@ -775,12 +806,48 @@ class Analyzer:
 
     # ------------------------------------------------------------------
 
+    def _can_assign_expr_type(self, node: ast.AST | None, got: str, expected: str) -> bool:
+        if can_assign_type(got, expected):
+            return True
+        return (
+            isinstance(node, ast.Dict)
+            and not node.keys
+            and parse_dict_type(expected) is not None
+        )
+
+    def _validate_dict_type(self, type_name: str, node: ast.AST) -> None:
+        dict_types = parse_dict_type(type_name)
+        if dict_types is None:
+            return
+        key_t, _ = dict_types
+        if not self._is_hashable_type(key_t):
+            self._error(node, _ERR_UNSUPPORTED, f"Dict key type '{key_t}' is not hashable")
+
+    def _is_hashable_type(self, type_name: str, seen: set[str] | None = None) -> bool:
+        normalized = normalize_type_name(type_name)
+        if normalized in {"int", "bool", "str", "bytes"}:
+            return True
+        if normalized in {"float", "Any"}:
+            return False
+        if parse_list_type(normalized) is not None or parse_set_type(normalized) is not None or parse_dict_type(normalized) is not None:
+            return False
+        class_info = self.project.lookup_class(normalized)
+        if class_info is None:
+            return False
+        if seen is None:
+            seen = set()
+        if normalized in seen:
+            return False
+        next_seen = set(seen)
+        next_seen.add(normalized)
+        return all(self._is_hashable_type(field_t, next_seen) for field_t in class_info.field_types)
+
+    # ------------------------------------------------------------------
+
     def _render_annotation(self, node: ast.AST, module: ModuleInfo) -> str:
-        rendered = ast.unparse(node)
-        compact = rendered.replace(" ", "")
-        if compact in {"int|float", "float|int"}:
-            return "int | float"
         if isinstance(node, ast.Name):
+            if node.id in {"int", "float", "bool", "str", "bytes"}:
+                return node.id
             if node.id in module.classes:
                 return module.classes[node.id][1].qualified_name
             imported = module.imported_symbols.get(node.id)
@@ -789,6 +856,26 @@ class Analyzer:
                 assert target_module is not None
                 if imported.symbol_name in target_module.classes:
                     return target_module.classes[imported.symbol_name][1].qualified_name
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            imported_module = module.imported_modules.get(node.value.id)
+            if imported_module is not None:
+                target_module = self.project.lookup_module(imported_module.module_name)
+                assert target_module is not None
+                if node.attr in target_module.classes:
+                    return target_module.classes[node.attr][1].qualified_name
+        if isinstance(node, ast.Subscript):
+            if isinstance(node.value, ast.Name) and node.value.id in {"list", "set"}:
+                inner = self._render_annotation(node.slice, module)
+                return f"{node.value.id}[{inner}]"
+            if isinstance(node.value, ast.Name) and node.value.id == "dict":
+                if isinstance(node.slice, ast.Tuple) and len(node.slice.elts) == 2:
+                    key_t = self._render_annotation(node.slice.elts[0], module)
+                    value_t = self._render_annotation(node.slice.elts[1], module)
+                    return f"dict[{key_t},{value_t}]"
+        rendered = ast.unparse(node)
+        compact = rendered.replace(" ", "")
+        if compact in {"int|float", "float|int"}:
+            return "int | float"
         return normalize_type_name(rendered)
 
     def _merge_collection_item_type(self, left: str, right: str) -> str:

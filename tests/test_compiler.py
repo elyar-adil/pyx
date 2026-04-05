@@ -347,6 +347,26 @@ def run(n: int) -> int:
     assert "call i64 @mod_geom__Point__total" in ir
 
 
+def test_compile_stdlib_import_reports_module_not_found(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+import logging
+from urllib.parse import urlparse
+
+def run() -> int:
+    return 0
+""",
+    )
+    try:
+        LLVMCompiler.from_path(src).compile_ir()
+    except CompileError as exc:
+        assert exc.code == "PYX2000"
+        assert "cannot resolve imported module 'logging'" in exc.message
+    else:
+        raise AssertionError("expected CompileError")
+
+
 def test_compile_list_append_and_index_lowering(tmp_path: Path) -> None:
     src = write_tmp(
         tmp_path,
@@ -454,5 +474,100 @@ def run(a: str, b: str) -> bool:
     except CompileError as exc:
         assert exc.code == "PYX2002"
         assert "string comparison" in exc.message
+    else:
+        raise AssertionError("expected CompileError")
+
+
+def test_compile_dict_literal_and_subscript_lowering(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run() -> int:
+    d: dict[str, int] = {"a": 1}
+    return d["a"]
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "%pyx.dict = type { ptr, i64, i64 }" in ir
+    assert "define private %pyx.dict @__pyx_dict_new__dict_str__int()" in ir
+    assert "define private %pyx.dict @__pyx_dict_set__dict_str__int" in ir
+    assert "define private i1 @__pyx_dict_try_get__dict_str__int" in ir
+    assert "call %pyx.dict @__pyx_dict_set__dict_str__int" in ir
+    assert "call i1 @__pyx_dict_try_get__dict_str__int" in ir
+
+
+def test_compile_dict_contains_get_and_len_lowering(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run() -> int:
+    d: dict[str, int] = {}
+    if "a" in d:
+        return d.get("a", 0)
+    d["a"] = 2
+    return len(d)
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "define private i1 @__pyx_dict_contains__dict_str__int" in ir
+    assert "call i1 @__pyx_dict_contains__dict_str__int" in ir
+    assert "call i1 @__pyx_dict_try_get__dict_str__int" in ir
+    assert "extractvalue %pyx.dict" in ir
+
+
+def test_compile_empty_dict_reassignment_uses_existing_type_context(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run() -> int:
+    d: dict[str, int] = {"a": 1}
+    d = {}
+    return len(d)
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "call %pyx.dict @__pyx_dict_new__dict_str__int()" in ir
+    assert "extractvalue %pyx.dict" in ir
+
+
+def test_compile_dict_with_hashable_class_key(tmp_path: Path) -> None:
+    src = write_project(
+        tmp_path,
+        {
+            "models.py": """
+class Point:
+    x: int
+    y: int
+""",
+            "main.py": """
+import models
+
+def run(n: int) -> int:
+    p = models.Point(n, 1)
+    d: dict[models.Point, int] = {p: 3}
+    return d[p]
+""",
+        },
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "define private i64 @__pyx_hash__models__Point" in ir
+    assert "define private i1 @__pyx_eq__models__Point" in ir
+    assert "define private i1 @__pyx_dict_try_get__dict_models__Point__int" in ir
+
+
+def test_compile_unhashable_dict_key_reports_error(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run() -> int:
+    d: dict[list[int], int] = {}
+    return 0
+""",
+    )
+    try:
+        LLVMCompiler.from_path(src).compile_ir()
+    except CompileError as exc:
+        assert exc.code == "PYX2002"
+        assert "not hashable" in exc.message
     else:
         raise AssertionError("expected CompileError")

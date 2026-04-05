@@ -4,8 +4,8 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Modules that are part of Python's standard library or runtime and should not
-# be resolved as local .py files. The compiler handles them via built-in rules.
+# Modules that are handled by dedicated compiler/analyzer rules instead of
+# being resolved as local PyX source files.
 BUILTIN_MODULES: frozenset[str] = frozenset({"ctypes"})
 
 
@@ -172,24 +172,26 @@ def _known_types_from_loaded(modules: dict[str, ModuleInfo]) -> set[str]:
 
 def _resolve_module_path(module_name: str, root_dir: Path) -> Path:
     parts = module_name.split(".")
-    # Search order: project root, then pyx_packages/<name>/<name>.py, then pyx_packages/<name>.py
-    candidates: list[Path] = [
-        root_dir.joinpath(*parts).with_suffix(".py"),
-        root_dir / "pyx_packages" / parts[0] / module_name.replace(".", "/"),
-        (root_dir / "pyx_packages").joinpath(*parts).with_suffix(".py"),
-    ]
-    # For single-segment module names also look for pyx_packages/<name>/<name>.py
-    if len(parts) == 1:
-        candidates.insert(
-            1,
-            root_dir / "pyx_packages" / parts[0] / f"{parts[0]}.py",
-        )
+    candidates: list[Path] = _module_candidates(root_dir, parts)
+    pkg_root = root_dir / "pyx_packages"
+    candidates.extend(_module_candidates(pkg_root, parts))
+    if pkg_root.exists():
+        for installed_pkg_dir in sorted(pkg_root.iterdir()):
+            if installed_pkg_dir.is_dir():
+                candidates.extend(_module_candidates(installed_pkg_dir, parts))
     for candidate in candidates:
-        if candidate.suffix != ".py":
-            candidate = candidate.with_suffix(".py")
         if candidate.exists():
             return candidate
     raise ProjectLoadError(f"cannot resolve imported module '{module_name}' from {root_dir}")
+
+
+def _module_candidates(base_dir: Path, parts: list[str]) -> list[Path]:
+    if not parts:
+        return []
+    return [
+        base_dir.joinpath(*parts).with_suffix(".py"),
+        base_dir.joinpath(*parts) / "__init__.py",
+    ]
 
 
 def _collect_class_info(node: ast.ClassDef, module_name: str, known_types: set[str]) -> ClassInfo:

@@ -67,15 +67,13 @@ def _make_registry(registry_path: Path | None) -> "Registry":  # noqa: F821
 
 def cmd_pkg_install(name: str, registry_path: Path | None, project_dir: Path) -> int:
     """Install *name* (and its dependencies) into ``<project_dir>/pyx_packages/``."""
-    from .pkg.installer import InstallError, install_package
-    from .pkg.installer import PKG_DIR_NAME
+    from .pkg.installer import InstallError, install_requirement
 
     registry = _make_registry(registry_path)
-    install_dir = project_dir / PKG_DIR_NAME
 
     try:
-        dest = install_package(name, registry, install_dir)
-        print(f"Installed {name} -> {dest}")
+        lock = install_requirement(name, registry, project_dir)
+        print(f"Installed {name} with {len(lock.packages)} package(s)")
         return 0
     except InstallError as exc:
         print(f"error: {exc}")
@@ -84,8 +82,9 @@ def cmd_pkg_install(name: str, registry_path: Path | None, project_dir: Path) ->
 
 def cmd_pkg_publish(source_dir: Path, registry_path: Path | None) -> int:
     """Package the project in *source_dir* and publish it to the registry."""
-    from .pkg.installer import publish_package
+    from .pkg.installer import InstallError, publish_package
     from .pkg.manifest import ManifestError, load_manifest
+    from .pkg.registry import RegistryError
 
     manifest_path = source_dir / "pyx.toml"
     try:
@@ -99,7 +98,7 @@ def cmd_pkg_publish(source_dir: Path, registry_path: Path | None) -> int:
         checksum = publish_package(source_dir, manifest, registry)
         print(f"Published {manifest.name}=={manifest.version}  checksum: {checksum}")
         return 0
-    except Exception as exc:
+    except (InstallError, RegistryError) as exc:
         print(f"error: failed to publish: {exc}")
         return 1
 

@@ -170,3 +170,81 @@ def run(n: int) -> int:
     )
     errors = Analyzer().analyze_path(src)
     assert any(e.code == "PYX1013" for e in errors)
+
+
+def test_dict_membership_get_and_empty_literal_supported(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run() -> int:
+    d: dict[str, int] = {}
+    if "a" in d:
+        return d.get("a", 0)
+    d["a"] = 1
+    return len(d)
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+def test_stdlib_import_reports_module_not_found(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+import logging
+from urllib.parse import urlparse
+
+def run(url: str) -> str:
+    logger = logging.getLogger("demo")
+    parsed = urlparse(url)
+    return url
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert any(e.code == "PYX1012" and "cannot resolve imported module 'logging'" in e.message for e in errors)
+
+
+def test_unhashable_dict_key_rejected(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run() -> int:
+    d: dict[list[int], int] = {}
+    return 0
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert any("not hashable" in e.message for e in errors)
+
+
+def test_hashable_class_key_supported(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+class Point:
+    x: int
+    y: int
+
+def run(n: int) -> int:
+    p = Point(n, 1)
+    d: dict[Point, int] = {p: 3}
+    return d[p]
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+def test_empty_dict_reassignment_uses_existing_type_context(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run() -> int:
+    d: dict[str, int] = {"a": 1}
+    d = {}
+    return len(d)
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []

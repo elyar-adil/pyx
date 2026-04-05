@@ -1,7 +1,16 @@
 """pyx.toml manifest parsing and serialisation."""
 from __future__ import annotations
 
-import tomllib
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError as _exc:
+        raise ImportError(
+            "tomllib (Python ≥3.11) or the 'tomli' package is required. "
+            "Install it with: pip install tomli"
+        ) from _exc
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,19 +30,17 @@ class PackageManifest:
     libraries: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
-def load_manifest(path: Path) -> PackageManifest:
-    """Parse a ``pyx.toml`` file and return a :class:`PackageManifest`."""
+def _parse_manifest_data(data: bytes, source: str) -> PackageManifest:
     try:
-        with open(path, "rb") as fh:
-            data = tomllib.load(fh)
-    except FileNotFoundError:
-        raise ManifestError(f"manifest not found: {path}")
+        parsed = tomllib.loads(data.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ManifestError(f"manifest must be UTF-8 encoded: {source}") from exc
     except tomllib.TOMLDecodeError as exc:
-        raise ManifestError(f"invalid TOML in {path}: {exc}")
+        raise ManifestError(f"invalid TOML in {source}: {exc}") from exc
 
-    pkg = data.get("package", {})
+    pkg = parsed.get("package", {})
     if not pkg:
-        raise ManifestError(f"[package] section missing in {path}")
+        raise ManifestError(f"[package] section missing in {source}")
 
     name: str = pkg.get("name", "")
     if not name:
@@ -52,7 +59,7 @@ def load_manifest(path: Path) -> PackageManifest:
         raise ManifestError(f"invalid package.version: {exc}") from exc
 
     dependencies: dict[str, str] = {}
-    for dep_name, constraint in data.get("dependencies", {}).items():
+    for dep_name, constraint in parsed.get("dependencies", {}).items():
         if not isinstance(constraint, str):
             raise ManifestError(
                 f"dependency '{dep_name}' value must be a version-constraint string"
@@ -60,7 +67,7 @@ def load_manifest(path: Path) -> PackageManifest:
         dependencies[dep_name] = constraint
 
     libraries: dict[str, dict[str, str]] = {}
-    for lib_name, lib_info in data.get("libraries", {}).items():
+    for lib_name, lib_info in parsed.get("libraries", {}).items():
         if not isinstance(lib_info, dict):
             raise ManifestError(f"library '{lib_name}' must be an inline table")
         libraries[lib_name] = {k: str(v) for k, v in lib_info.items()}
@@ -72,6 +79,15 @@ def load_manifest(path: Path) -> PackageManifest:
         dependencies=dependencies,
         libraries=libraries,
     )
+
+
+def load_manifest(path: Path) -> PackageManifest:
+    """Parse a ``pyx.toml`` file and return a :class:`PackageManifest`."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        raise ManifestError(f"manifest not found: {path}")
+    return _parse_manifest_data(data, str(path))
 
 
 def save_manifest(manifest: PackageManifest, path: Path) -> None:

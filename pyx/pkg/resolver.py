@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .manifest import PackageManifest
 from .registry import Registry, RegistryError
-from .semver import best_matching
+from .semver import Version, best_matching, matches_constraint
 
 
 class ResolveError(Exception):
@@ -76,35 +76,72 @@ def resolve_dependencies(manifest: PackageManifest, registry: Registry) -> LockF
     Returns a fully-populated :class:`LockFile` ready to be saved.
     Raises :class:`ResolveError` when a dependency cannot be satisfied.
     """
-    packages: list[LockedPackage] = []
-    seen: set[str] = set()
-    _resolve_recursive(manifest.dependencies, registry, packages, seen)
-    return LockFile(packages=packages)
+    resolved: list[LockedPackage] = []
+    selected: dict[str, LockedPackage] = {}
+    for name, constraint in manifest.dependencies.items():
+        _resolve_one(
+            name=name,
+            constraint=constraint,
+            registry=registry,
+            resolved=resolved,
+            selected=selected,
+            parent=manifest.name,
+        )
+    return LockFile(packages=resolved)
 
 
-def _resolve_recursive(
-    dependencies: dict[str, str],
+def _resolve_one(
+    name: str,
+    constraint: str,
     registry: Registry,
     resolved: list[LockedPackage],
-    seen: set[str],
+    selected: dict[str, LockedPackage],
+    parent: str,
 ) -> None:
-    for name, constraint in dependencies.items():
-        if name in seen:
-            continue
-        seen.add(name)
+    existing = selected.get(name)
+    if existing is not None:
+        _ensure_locked_version_matches(existing, constraint, parent)
+        return
 
-        versions = registry.list_versions(name)
-        if not versions:
-            raise ResolveError(
-                f"dependency '{name}' not found in registry"
+    pkg_versions = registry.get_package_versions(name)
+    if not pkg_versions:
+        raise ResolveError(f"dependency '{name}' not found in registry")
+
+    chosen = best_matching(list(pkg_versions.keys()), constraint)
+    if chosen is None:
+        raise ResolveError(
+            f"no version of '{name}' satisfies '{constraint}'; "
+            f"available versions: {', '.join(sorted(pkg_versions))}"
+        )
+
+    checksum = pkg_versions.get(chosen) or ""
+    locked = LockedPackage(name=name, version=chosen, checksum=checksum)
+    selected[name] = locked
+    try:
+        try:
+            dep_manifest = registry.load_manifest(name, chosen)
+        except RegistryError as exc:
+            raise ResolveError(str(exc)) from exc
+        for dep_name, dep_constraint in dep_manifest.dependencies.items():
+            _resolve_one(
+                name=dep_name,
+                constraint=dep_constraint,
+                registry=registry,
+                resolved=resolved,
+                selected=selected,
+                parent=f"{name}=={chosen}",
             )
+    except Exception:
+        selected.pop(name, None)
+        raise
 
-        chosen = best_matching(versions, constraint)
-        if chosen is None:
-            raise ResolveError(
-                f"no version of '{name}' satisfies '{constraint}'; "
-                f"available versions: {', '.join(sorted(versions))}"
-            )
+    resolved.append(locked)
 
-        checksum = registry.get_checksum(name, chosen) or ""
-        resolved.append(LockedPackage(name=name, version=chosen, checksum=checksum))
+
+def _ensure_locked_version_matches(pkg: LockedPackage, constraint: str, parent: str) -> None:
+    version = Version.parse(pkg.version)
+    if not matches_constraint(version, constraint):
+        raise ResolveError(
+            f"dependency conflict for '{pkg.name}': {parent} requires '{constraint}', "
+            f"but locked version is '{pkg.version}'"
+        )

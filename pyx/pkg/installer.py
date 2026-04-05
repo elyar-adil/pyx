@@ -1,14 +1,14 @@
 """Package install / publish helpers for PyX."""
 from __future__ import annotations
 
-import hashlib
 import shutil
 import tarfile
 import tempfile
 from pathlib import Path
+from pathlib import PurePosixPath
 
 from .manifest import PackageManifest
-from .registry import Registry, RegistryError
+from .registry import Registry, RegistryError, _sha256
 from .resolver import LockFile, ResolveError, resolve_dependencies
 from .semver import best_matching
 
@@ -20,16 +20,38 @@ class InstallError(Exception):
     pass
 
 
-def _sha256(path: Path) -> str:
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-
-
 def _safe_extractall(tf: tarfile.TarFile, dest: Path) -> None:
-    """Extract *tf* to *dest* in a forward-compatible way."""
+    """Extract *tf* to *dest* while rejecting unsafe archive members."""
+    base = dest.resolve()
+    members: list[tarfile.TarInfo] = []
+    for member in tf.getmembers():
+        parts = PurePosixPath(member.name).parts
+        if not parts or any(part in {"", ".", ".."} for part in parts):
+            raise InstallError(f"unsafe archive member '{member.name}'")
+        if member.islnk() or member.issym() or member.isdev():
+            raise InstallError(f"unsupported archive member '{member.name}'")
+        target = (base / Path(*parts)).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError as exc:
+            raise InstallError(f"unsafe archive member '{member.name}'") from exc
+        members.append(member)
+
     try:
-        tf.extractall(dest, filter="data")  # Python 3.12+
+        tf.extractall(dest, members=members, filter="data")  # Python 3.12+
     except TypeError:
-        tf.extractall(dest)  # noqa: S202 – best effort for Python 3.11
+        tf.extractall(dest, members=members)  # noqa: S202
+
+
+def _install_lockfile(lock: LockFile, registry: Registry, project_dir: Path) -> LockFile:
+    install_dir = project_dir / PKG_DIR_NAME
+    for pkg in lock.packages:
+        try:
+            install_package(pkg.name, registry, install_dir, pkg.version)
+        except InstallError as exc:
+            raise InstallError(f"failed to install '{pkg.name}': {exc}") from exc
+    lock.save(project_dir / "pyx.lock")
+    return lock
 
 
 # ---------------------------------------------------------------------------
@@ -48,15 +70,15 @@ def install_package(
     Files are extracted into ``install_dir/<name>/``.
     Returns the extraction directory.
     """
-    versions = registry.list_versions(name)
-    if not versions:
+    pkg_versions = registry.get_package_versions(name)
+    if not pkg_versions:
         raise InstallError(f"package '{name}' not found in registry")
 
-    chosen = best_matching(versions, constraint)
+    chosen = best_matching(list(pkg_versions.keys()), constraint)
     if chosen is None:
         raise InstallError(
             f"no version of '{name}' satisfies '{constraint}'; "
-            f"available: {', '.join(sorted(versions))}"
+            f"available: {', '.join(sorted(pkg_versions))}"
         )
 
     try:
@@ -64,9 +86,8 @@ def install_package(
     except RegistryError as exc:
         raise InstallError(str(exc)) from exc
 
-    # Verify checksum
     actual = _sha256(archive_path)
-    expected = registry.get_checksum(name, chosen)
+    expected = pkg_versions.get(chosen)
     if expected and actual != expected:
         raise InstallError(
             f"checksum mismatch for '{name}=={chosen}': "
@@ -84,6 +105,25 @@ def install_package(
     return dest
 
 
+def install_requirement(
+    name: str,
+    registry: Registry,
+    project_dir: Path,
+    constraint: str = "*",
+) -> LockFile:
+    """Resolve and install *name* plus all of its dependencies."""
+    root_manifest = PackageManifest(
+        name="__root__",
+        version="0.0.0",
+        dependencies={name: constraint},
+    )
+    try:
+        lock = resolve_dependencies(root_manifest, registry)
+    except ResolveError as exc:
+        raise InstallError(str(exc)) from exc
+    return _install_lockfile(lock, registry, project_dir)
+
+
 def install_from_manifest(
     manifest: PackageManifest,
     registry: Registry,
@@ -99,16 +139,7 @@ def install_from_manifest(
     except ResolveError as exc:
         raise InstallError(str(exc)) from exc
 
-    install_dir = project_dir / PKG_DIR_NAME
-
-    for pkg in lock.packages:
-        try:
-            install_package(pkg.name, registry, install_dir, pkg.version)
-        except InstallError as exc:
-            raise InstallError(f"failed to install '{pkg.name}': {exc}") from exc
-
-    lock.save(project_dir / "pyx.lock")
-    return lock
+    return _install_lockfile(lock, registry, project_dir)
 
 
 # ---------------------------------------------------------------------------
