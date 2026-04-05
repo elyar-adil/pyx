@@ -172,10 +172,24 @@ def _known_types_from_loaded(modules: dict[str, ModuleInfo]) -> set[str]:
 
 def _resolve_module_path(module_name: str, root_dir: Path) -> Path:
     parts = module_name.split(".")
-    path = root_dir.joinpath(*parts).with_suffix(".py")
-    if not path.exists():
-        raise ProjectLoadError(f"cannot resolve imported module '{module_name}' from {root_dir}")
-    return path
+    # Search order: project root, then pyx_packages/<name>/<name>.py, then pyx_packages/<name>.py
+    candidates: list[Path] = [
+        root_dir.joinpath(*parts).with_suffix(".py"),
+        root_dir / "pyx_packages" / parts[0] / module_name.replace(".", "/"),
+        (root_dir / "pyx_packages").joinpath(*parts).with_suffix(".py"),
+    ]
+    # For single-segment module names also look for pyx_packages/<name>/<name>.py
+    if len(parts) == 1:
+        candidates.insert(
+            1,
+            root_dir / "pyx_packages" / parts[0] / f"{parts[0]}.py",
+        )
+    for candidate in candidates:
+        if candidate.suffix != ".py":
+            candidate = candidate.with_suffix(".py")
+        if candidate.exists():
+            return candidate
+    raise ProjectLoadError(f"cannot resolve imported module '{module_name}' from {root_dir}")
 
 
 def _collect_class_info(node: ast.ClassDef, module_name: str, known_types: set[str]) -> ClassInfo:
