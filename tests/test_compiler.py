@@ -228,6 +228,34 @@ def flip(b: bool) -> bool:
     assert "xor i1" in ir
 
 
+def test_boolop_and_lowering(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def both(a: bool, b: bool) -> bool:
+    return a and b
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "boolop_next" in ir
+    assert "boolop_short" in ir
+    assert "phi i1 [0," in ir
+
+
+def test_boolop_or_lowering(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def either(a: bool, b: bool) -> bool:
+    return a or b
+""",
+    )
+    ir = LLVMCompiler.from_path(src).compile_ir()
+    assert "boolop_next" in ir
+    assert "boolop_short" in ir
+    assert "phi i1 [1," in ir
+
+
 def test_unary_negate_int(tmp_path: Path) -> None:
     src = write_tmp(
         tmp_path,

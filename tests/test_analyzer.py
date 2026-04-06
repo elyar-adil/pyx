@@ -248,3 +248,29 @@ def run() -> int:
     )
     errors = Analyzer().analyze_path(src)
     assert errors == []
+
+
+def test_boolop_and_or_infers_bool(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run(a: bool, b: bool, c: bool) -> bool:
+    left = a and b
+    right = left or c
+    return right
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert errors == []
+
+
+def test_boolop_requires_bool_operands(tmp_path: Path) -> None:
+    src = write_tmp(
+        tmp_path,
+        """
+def run(a: bool, n: int) -> bool:
+    return a and n
+""",
+    )
+    errors = Analyzer().analyze_path(src)
+    assert any("boolean operator expects bool" in e.message for e in errors)

@@ -1,6 +1,6 @@
 # PyX Roadmap
 
-> Last updated: 2026-04-05（Phase 5 包管理器）
+> Last updated: 2026-04-06（BoolOp `and` / `or` 已落地）
 
 PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI 语言特性、包管理器。
 平台绑定（Win32、X11、Wayland 等）、浏览器引擎等属于独立的生态包，不在本仓库职责范围内。
@@ -16,7 +16,7 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 - ✅ `pyx build` 构建产物：`.ll` + 可选 `.o`
 - ✅ Phase 4 扩展 FFI：`POINTER(T)` 组合指针类型、`str`/`bytes` ↔ `c_char_p` 互操作、`c_char_p` 返回 → `bytes`（strlen 路径）、`Any` 不透明指针（`c_void_p`）、`ctypes.string_at(ptr, size)` → `bytes`、cfuncptr 调用参数类型检查
 - ✅ Phase 5 包管理器：`pyx.toml` 格式、语义化版本约束、本地注册表、`pyx.lock` 锁文件、`pyx pkg install` / `pyx pkg publish`、`pyx_packages/` 搜索路径
-- ✅ 162 个自动化测试全部通过
+- ✅ 186 个自动化测试全部通过
 
 ---
 
@@ -31,6 +31,7 @@ PyX 只负责**纯语言**本身：语法规则、类型系统、编译器、FFI
 - ✅ 统一 analyzer / compiler 错误格式与错误码（`PYX1xxx` / `PYX2xxx`）
 - ✅ `!=` 比较运算符（int、float、bool、union 全路径）
 - ✅ 一元运算符：`not`（xor i1 1）、`-`（sub 0 / fneg）
+- ✅ 短路布尔运算：`and` / `or`（analyzer 类型检查 + LLVM 短路降级）
 - ✅ `x: T = expr` 带注解赋值（AnnAssign）与 analyzer 完全对齐
 
 ### 已知不在 Phase 2 范围

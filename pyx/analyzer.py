@@ -440,6 +440,16 @@ class Analyzer:
                 return merged
             return "Any"
 
+        if isinstance(node, ast.BoolOp):
+            if isinstance(node.op, (ast.And, ast.Or)):
+                for value in node.values:
+                    value_t = self._infer_expr_type(value, ctx)
+                    if not can_assign_type(value_t, "bool"):
+                        self._error(value, _ERR_CALL_ARG_TYPE, f"boolean operator expects bool, got {value_t}")
+                return "bool"
+            self._error(node, _ERR_UNSUPPORTED, f"Unsupported boolean operator '{node.op.__class__.__name__}'")
+            return "Any"
+
         if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
             left = self._infer_expr_type(node.left, ctx)
             right = self._infer_expr_type(node.comparators[0], ctx)

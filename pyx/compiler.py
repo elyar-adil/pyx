@@ -1275,6 +1275,9 @@ class _FunctionCompiler:
                 return self._compile_numeric_binop(left, left_t, right, right_t, node, "mul", "fmul")
             raise CompileError("only +, -, * are supported in LLVM mode", code=_ERR_UNSUPPORTED_EXPRESSION, line=node.lineno, col=node.col_offset)
 
+        if isinstance(node, ast.BoolOp):
+            return self._compile_boolop(node)
+
         if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
             left, left_t = self._compile_expr(node.left)
             right, right_t = self._compile_expr(node.comparators[0])
@@ -2378,6 +2381,58 @@ class _FunctionCompiler:
             f"  {result} = phi {llvm_type(value_t)} [{loaded}, %{found_label}], [{coerced_default}, %{miss_label}]"
         )
         return result, value_t
+
+    def _compile_boolop(self, node: ast.BoolOp) -> tuple[str, str]:
+        if not isinstance(node.op, (ast.And, ast.Or)):
+            raise CompileError(
+                f"unsupported boolean operator {node.op.__class__.__name__}",
+                code=_ERR_UNSUPPORTED_EXPRESSION,
+                line=node.lineno,
+                col=node.col_offset,
+            )
+        if not node.values:
+            raise CompileError(
+                "boolean operator requires at least one operand",
+                code=_ERR_UNSUPPORTED_EXPRESSION,
+                line=node.lineno,
+                col=node.col_offset,
+            )
+
+        current_val, current_t = self._compile_expr(node.values[0])
+        self._require_assignable(current_t, "bool", node.values[0], "boolean operator requires bool operand")
+
+        index = 1
+        while index < len(node.values):
+            next_label = self._new_label("boolop_next")
+            short_label = self._new_label("boolop_short")
+            end_label = self._new_label("boolop_end")
+            if isinstance(node.op, ast.And):
+                self.body_lines.append(f"  br i1 {current_val}, label %{next_label}, label %{short_label}")
+                self.body_lines.append(f"{short_label}:")
+                self.body_lines.append(f"  br label %{end_label}")
+                self.body_lines.append(f"{next_label}:")
+                next_val, next_t = self._compile_expr(node.values[index])
+                self._require_assignable(next_t, "bool", node.values[index], "boolean operator requires bool operand")
+                self.body_lines.append(f"  br label %{end_label}")
+                self.body_lines.append(f"{end_label}:")
+                phi_reg = self._new_reg()
+                self.body_lines.append(f"  {phi_reg} = phi i1 [0, %{short_label}], [{next_val}, %{next_label}]")
+                current_val = phi_reg
+            else:
+                self.body_lines.append(f"  br i1 {current_val}, label %{short_label}, label %{next_label}")
+                self.body_lines.append(f"{short_label}:")
+                self.body_lines.append(f"  br label %{end_label}")
+                self.body_lines.append(f"{next_label}:")
+                next_val, next_t = self._compile_expr(node.values[index])
+                self._require_assignable(next_t, "bool", node.values[index], "boolean operator requires bool operand")
+                self.body_lines.append(f"  br label %{end_label}")
+                self.body_lines.append(f"{end_label}:")
+                phi_reg = self._new_reg()
+                self.body_lines.append(f"  {phi_reg} = phi i1 [1, %{short_label}], [{next_val}, %{next_label}]")
+                current_val = phi_reg
+            index += 1
+
+        return current_val, "bool"
 
     def _render_annotation(self, node: ast.AST) -> str:
         if isinstance(node, ast.Name) and node.id in self.module.classes:
