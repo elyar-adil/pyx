@@ -5,8 +5,20 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pyx"
 version = "0.1.0"
-description = "PyX static subset prototype"
+description = "PyX – Python eXtended Static compiler with native Windows GUI"
 requires-python = ">=3.11"
+
+[project.scripts]
+pyx = "pyx.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pyx*"]
+
+# Include .pyx source files in the installed package so that the import
+# hook registered in pyx/__init__.py can find them at runtime.
+[tool.setuptools.package-data]
+"*" = ["*.pyx"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
